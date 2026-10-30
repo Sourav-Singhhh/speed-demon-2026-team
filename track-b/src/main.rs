@@ -80,37 +80,34 @@ pub fn extract_query_vocab(queries_data: &[u8]) -> HashSet<Vec<u8>> {
     vocab
 }
 
+pub const SENTINEL_TOKEN_ID: u32 = u32::MAX;
+
 pub struct VocabTable {
     pub map: HashMap<Vec<u8>, u32>,
     pub tokens: Vec<Vec<u8>>,
-    pub is_queried: Vec<bool>,
 }
 
 impl VocabTable {
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            tokens: Vec::new(),
-            is_queried: Vec::new(),
+    pub fn from_query_vocab(query_vocab: &HashSet<Vec<u8>>) -> Self {
+        let mut sorted: Vec<Vec<u8>> = query_vocab.iter().cloned().collect();
+        sorted.sort_unstable();
+        let mut map = HashMap::with_capacity(sorted.len());
+        let mut tokens = Vec::with_capacity(sorted.len());
+        for (id, tok) in sorted.into_iter().enumerate() {
+            map.insert(tok.clone(), id as u32);
+            tokens.push(tok);
         }
+        Self { map, tokens }
     }
 
-    pub fn get_or_intern(&mut self, token: &[u8], query_vocab: &HashSet<Vec<u8>>) -> u32 {
-        if let Some(&id) = self.map.get(token) {
-            id
-        } else {
-            let id = self.tokens.len() as u32;
-            let queried = query_vocab.contains(token);
-            let tok_vec = token.to_vec();
-            self.map.insert(tok_vec.clone(), id);
-            self.tokens.push(tok_vec);
-            self.is_queried.push(queried);
-            id
-        }
-    }
-
+    #[inline]
     pub fn get_id(&self, token: &[u8]) -> Option<u32> {
         self.map.get(token).copied()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.tokens.len()
     }
 }
 
@@ -124,94 +121,290 @@ pub struct CorpusIndex {
     pub query_vocab_size: usize,
 }
 
-impl CorpusIndex {
-    pub fn build(docs_data: &[u8], query_vocab: &HashSet<Vec<u8>>) -> Result<Self, String> {
-        let mut vocab = VocabTable::new();
-        let mut doc_offsets: Vec<u32> = Vec::with_capacity(300_000);
-        let mut doc_tokens: Vec<u32> = Vec::with_capacity(37_000_000);
-        let mut postings: HashMap<u32, Vec<u32>> = HashMap::with_capacity(query_vocab.len());
+pub struct WorkerChunkResult {
+    pub first_doc_id: usize,
+    pub num_docs: usize,
+    pub total_tokens: usize,
+    pub doc_offsets: Vec<u32>,
+    pub doc_tokens: Vec<u32>,
+    pub postings: HashMap<u32, Vec<u32>>,
+}
 
-        let mut scratch = Vec::with_capacity(32);
-        let mut seen_in_doc: Vec<u32> = Vec::with_capacity(256);
-        let mut num_docs = 0;
-        let mut total_tokens = 0;
+pub fn partition_docs_data(docs_data: &[u8], num_chunks: usize) -> Vec<&[u8]> {
+    if docs_data.is_empty() || num_chunks <= 1 {
+        return vec![docs_data];
+    }
 
-        let mut pos = 0;
-        while pos < docs_data.len() {
-            let line_start = pos;
-            while pos < docs_data.len() && docs_data[pos] != b'\n' {
-                pos += 1;
-            }
-            let mut line_end = pos;
-            if pos < docs_data.len() && docs_data[pos] == b'\n' {
-                pos += 1;
-            }
-            if line_end > line_start && docs_data[line_end - 1] == b'\r' {
-                line_end -= 1;
-            }
-            let line = &docs_data[line_start..line_end];
-            if line.is_empty() {
-                continue;
-            }
+    let total_len = docs_data.len();
+    let mut boundaries = Vec::with_capacity(num_chunks + 1);
+    boundaries.push(0);
 
-            let tab_pos = line
-                .iter()
-                .position(|&b| b == b'\t')
-                .ok_or_else(|| "missing TAB in doc line".to_string())?;
+    for i in 1..num_chunks {
+        let tentative = (i * total_len) / num_chunks;
+        let mut b = tentative;
+        while b < total_len && docs_data[b] != b'\n' {
+            b += 1;
+        }
+        if b < total_len {
+            b += 1;
+        }
+        let prev = *boundaries.last().unwrap();
+        if b < prev {
+            b = prev;
+        }
+        boundaries.push(b);
+    }
+    boundaries.push(total_len);
 
-            let id_bytes = &line[..tab_pos];
-            let id_str = std::str::from_utf8(id_bytes).map_err(|e| e.to_string())?;
-            let doc_id: usize = id_str.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let mut chunks = Vec::with_capacity(num_chunks);
+    for w in boundaries.windows(2) {
+        chunks.push(&docs_data[w[0]..w[1]]);
+    }
+    chunks
+}
 
-            if doc_id != num_docs {
-                return Err(format!("expected doc id {}, got {}", num_docs, doc_id));
-            }
+pub fn parse_doc_chunk(chunk: &[u8], vocab: &VocabTable) -> Result<WorkerChunkResult, String> {
+    if chunk.is_empty() {
+        return Ok(WorkerChunkResult {
+            first_doc_id: 0,
+            num_docs: 0,
+            total_tokens: 0,
+            doc_offsets: vec![0],
+            doc_tokens: Vec::new(),
+            postings: HashMap::new(),
+        });
+    }
 
-            let text = &line[tab_pos + 1..];
-            doc_offsets.push(doc_tokens.len() as u32);
-            seen_in_doc.clear();
+    let approx_docs = (chunk.len() / 80).max(64);
+    let mut doc_offsets = Vec::with_capacity(approx_docs + 1);
+    let mut doc_tokens = Vec::with_capacity(approx_docs * 20);
+    let mut postings: HashMap<u32, Vec<u32>> = HashMap::with_capacity(vocab.len().min(4096));
+    let mut scratch = Vec::with_capacity(32);
+    let mut seen_in_doc: Vec<u32> = Vec::with_capacity(256);
 
-            for_each_token(text, &mut scratch, |tok| {
-                total_tokens += 1;
-                let token_id = vocab.get_or_intern(tok, query_vocab);
-                doc_tokens.push(token_id);
+    let mut pos = 0;
+    let mut first_doc_id = 0;
+    let mut num_docs = 0;
+    let mut total_tokens = 0;
+    let mut has_first_doc = false;
 
-                if vocab.is_queried[token_id as usize] {
-                    seen_in_doc.push(token_id);
-                }
-            });
-
-            // Deduplicate queried terms within this document so doc_id is added once
-            seen_in_doc.sort_unstable();
-            seen_in_doc.dedup();
-
-            for &token_id in &seen_in_doc {
-                postings
-                    .entry(token_id)
-                    .or_insert_with(Vec::new)
-                    .push(doc_id as u32);
-            }
-
-            num_docs += 1;
+    while pos < chunk.len() {
+        let line_start = pos;
+        while pos < chunk.len() && chunk[pos] != b'\n' {
+            pos += 1;
+        }
+        let mut line_end = pos;
+        if pos < chunk.len() && chunk[pos] == b'\n' {
+            pos += 1;
+        }
+        if line_end > line_start && chunk[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        let line = &chunk[line_start..line_end];
+        if line.is_empty() {
+            continue;
         }
 
-        doc_offsets.push(doc_tokens.len() as u32);
+        let tab_pos = line
+            .iter()
+            .position(|&b| b == b'\t')
+            .ok_or_else(|| "missing TAB in doc line".to_string())?;
 
+        let id_bytes = &line[..tab_pos];
+        let id_str = std::str::from_utf8(id_bytes).map_err(|e| e.to_string())?;
+        let doc_id: usize = id_str.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+
+        if !has_first_doc {
+            first_doc_id = doc_id;
+            has_first_doc = true;
+        } else {
+            let expected_id = first_doc_id + num_docs;
+            if doc_id != expected_id {
+                return Err(format!("expected doc id {}, got {}", expected_id, doc_id));
+            }
+        }
+
+        let text = &line[tab_pos + 1..];
+        doc_offsets.push(doc_tokens.len() as u32);
+        seen_in_doc.clear();
+
+        for_each_token(text, &mut scratch, |tok| {
+            total_tokens += 1;
+            if let Some(token_id) = vocab.get_id(tok) {
+                doc_tokens.push(token_id);
+                seen_in_doc.push(token_id);
+            } else {
+                doc_tokens.push(SENTINEL_TOKEN_ID);
+            }
+        });
+
+        seen_in_doc.sort_unstable();
+        seen_in_doc.dedup();
+
+        for &token_id in &seen_in_doc {
+            postings
+                .entry(token_id)
+                .or_insert_with(Vec::new)
+                .push(doc_id as u32);
+        }
+
+        num_docs += 1;
+    }
+
+    doc_offsets.push(doc_tokens.len() as u32);
+
+    Ok(WorkerChunkResult {
+        first_doc_id,
+        num_docs,
+        total_tokens,
+        doc_offsets,
+        doc_tokens,
+        postings,
+    })
+}
+
+impl CorpusIndex {
+    pub fn build_sequential(docs_data: &[u8], query_vocab: &HashSet<Vec<u8>>) -> Result<Self, String> {
+        let vocab = VocabTable::from_query_vocab(query_vocab);
+        let worker_res = parse_doc_chunk(docs_data, &vocab)?;
         Ok(Self {
-            num_docs,
-            total_tokens,
-            doc_offsets,
-            doc_tokens,
-            postings,
+            num_docs: worker_res.num_docs,
+            total_tokens: worker_res.total_tokens,
+            doc_offsets: worker_res.doc_offsets,
+            doc_tokens: worker_res.doc_tokens,
+            postings: worker_res.postings,
             vocab,
             query_vocab_size: query_vocab.len(),
         })
+    }
+
+    pub fn build_parallel(
+        docs_data: &[u8],
+        query_vocab: &HashSet<Vec<u8>>,
+        num_threads: usize,
+    ) -> Result<(Self, std::time::Duration, std::time::Duration, Vec<usize>), String> {
+        let vocab = VocabTable::from_query_vocab(query_vocab);
+        let actual_workers = num_threads.max(1);
+
+        let t_workers_start = std::time::Instant::now();
+        let chunks = partition_docs_data(docs_data, actual_workers);
+
+        let worker_results: Result<Vec<WorkerChunkResult>, String> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                let vocab_ref = &vocab;
+                handles.push(s.spawn(move || parse_doc_chunk(chunk, vocab_ref)));
+            }
+
+            let mut results = Vec::with_capacity(handles.len());
+            for h in handles {
+                match h.join() {
+                    Ok(res) => match res {
+                        Ok(w) => results.push(w),
+                        Err(e) => return Err(e),
+                    },
+                    Err(panic_err) => {
+                        std::panic::resume_unwind(panic_err);
+                    }
+                }
+            }
+            Ok(results)
+        });
+
+        let mut worker_results = worker_results?;
+        let t_workers = t_workers_start.elapsed();
+
+        let t_merge_start = std::time::Instant::now();
+        let mut total_docs = 0;
+        let mut total_tokens = 0;
+        let mut total_doc_tokens = 0;
+        let mut expected_doc_id = 0;
+        let mut worker_doc_counts = Vec::with_capacity(worker_results.len());
+
+        for w in &worker_results {
+            worker_doc_counts.push(w.num_docs);
+            if w.num_docs > 0 {
+                if w.first_doc_id != expected_doc_id {
+                    return Err(format!(
+                        "worker document gap: expected doc {}, got {}",
+                        expected_doc_id, w.first_doc_id
+                    ));
+                }
+                expected_doc_id += w.num_docs;
+                total_docs += w.num_docs;
+                total_tokens += w.total_tokens;
+                total_doc_tokens += w.doc_tokens.len();
+            }
+        }
+
+        let mut merged_doc_tokens = Vec::with_capacity(total_doc_tokens);
+        let mut merged_doc_offsets = Vec::with_capacity(total_docs + 1);
+        merged_doc_offsets.push(0);
+
+        let mut token_base: u32 = 0;
+        for w in &mut worker_results {
+            if w.num_docs == 0 {
+                continue;
+            }
+            for &off in &w.doc_offsets[1..] {
+                merged_doc_offsets.push(token_base + off);
+            }
+            token_base += w.doc_tokens.len() as u32;
+            merged_doc_tokens.append(&mut w.doc_tokens);
+            w.doc_tokens = Vec::new();
+            w.doc_offsets = Vec::new();
+        }
+
+        let mut term_lengths: HashMap<u32, usize> = HashMap::with_capacity(vocab.len());
+        for w in &worker_results {
+            for (&token_id, list) in &w.postings {
+                *term_lengths.entry(token_id).or_insert(0) += list.len();
+            }
+        }
+
+        let mut merged_postings: HashMap<u32, Vec<u32>> = HashMap::with_capacity(term_lengths.len());
+        for (&token_id, &total_len) in &term_lengths {
+            merged_postings.insert(token_id, Vec::with_capacity(total_len));
+        }
+
+        for w in &mut worker_results {
+            for (token_id, list) in w.postings.drain() {
+                if let Some(target) = merged_postings.get_mut(&token_id) {
+                    target.extend(list);
+                }
+            }
+        }
+        let t_merge = t_merge_start.elapsed();
+
+        let corpus = Self {
+            num_docs: total_docs,
+            total_tokens,
+            doc_offsets: merged_doc_offsets,
+            doc_tokens: merged_doc_tokens,
+            postings: merged_postings,
+            vocab,
+            query_vocab_size: query_vocab.len(),
+        };
+
+        Ok((corpus, t_workers, t_merge, worker_doc_counts))
+    }
+
+    pub fn build(docs_data: &[u8], query_vocab: &HashSet<Vec<u8>>) -> Result<Self, String> {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        if num_threads <= 1 {
+            Self::build_sequential(docs_data, query_vocab)
+        } else {
+            Self::build_parallel(docs_data, query_vocab, num_threads).map(|(c, _, _, _)| c)
+        }
     }
 
     pub fn retained_postings_count(&self) -> usize {
         self.postings.values().map(|p| p.len()).sum()
     }
 }
+
 
 #[derive(Clone)]
 pub struct BitSet {
@@ -709,12 +902,6 @@ fn main() {
     let queries_data = fs::read(&queries_path).expect("failed to read queries.txt");
     let docs_data = fs::read(&docs_path).expect("failed to read docs.txt");
 
-    let t_ingest_start = std::time::Instant::now();
-    let query_vocab = extract_query_vocab(&queries_data);
-    let corpus = CorpusIndex::build(&docs_data, &query_vocab).expect("corpus index build failed");
-    let parsed_queries = parse_all_queries(&queries_data);
-    let t_ingest = t_ingest_start.elapsed();
-
     let num_threads = env::var("RAYON_NUM_THREADS")
         .or_else(|_| env::var("THREADS"))
         .ok()
@@ -725,7 +912,28 @@ fn main() {
                 .unwrap_or(4)
         });
 
+    let ingest_threads = env::var("INGEST_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(num_threads);
+
     let mode = env::var("QUERY_MODE").unwrap_or_else(|_| "parallel".to_string());
+    let ingest_mode = env::var("INGEST_MODE").unwrap_or_else(|_| "parallel".to_string());
+
+    let t_ingest_start = std::time::Instant::now();
+    let query_vocab = extract_query_vocab(&queries_data);
+
+    let (corpus, t_workers, t_merge, worker_doc_counts) = if ingest_mode == "seq" || ingest_threads <= 1 {
+        let t_s = std::time::Instant::now();
+        let c = CorpusIndex::build_sequential(&docs_data, &query_vocab).expect("corpus index build failed");
+        let dt = t_s.elapsed();
+        let n_docs = c.num_docs;
+        (c, dt, std::time::Duration::ZERO, vec![n_docs])
+    } else {
+        CorpusIndex::build_parallel(&docs_data, &query_vocab, ingest_threads).expect("corpus index build failed")
+    };
+    let parsed_queries = parse_all_queries(&queries_data);
+    let t_ingest = t_ingest_start.elapsed();
 
     let (results, t_query, t_bool_cpu, t_phrase_cpu) = if mode == "seq" {
         let t_q_start = std::time::Instant::now();
@@ -754,9 +962,10 @@ fn main() {
     let t_total = t0.elapsed();
 
     eprintln!(
-        "Index pipeline [mode={}, threads={}]: docs={}, queries={}, ingest={:?}, query_wall={:?}, total={:?}",
-        mode, num_threads, corpus.num_docs, parsed_queries.len(), t_ingest, t_query, t_total
+        "Index pipeline [mode={}, threads={}, ingest_threads={}]: docs={}, queries={}, vocab_entries={}, stored_postings={}, ingest={:?} (workers={:?}, merge={:?}), query_wall={:?}, total={:?}",
+        mode, num_threads, worker_doc_counts.len(), corpus.num_docs, parsed_queries.len(), corpus.vocab.len(), corpus.retained_postings_count(), t_ingest, t_workers, t_merge, t_query, t_total
     );
+    eprintln!("Ingest workers doc counts: {:?}", worker_doc_counts);
     eprintln!(
         "Query work breakdown (aggregate CPU): bool={:?}, phrase={:?}",
         t_bool_cpu, t_phrase_cpu
@@ -868,10 +1077,10 @@ mod tests {
 
         let bail_id = corpus.vocab.get_id(b"bail").unwrap();
         let bond_id = corpus.vocab.get_id(b"bond").unwrap();
-        let unqueried_id = corpus.vocab.get_id(b"unqueried").unwrap();
 
+        assert_eq!(corpus.vocab.get_id(b"unqueried"), None);
         assert_eq!(d0_tokens, &[bail_id, bond_id]);
-        assert_eq!(d1_tokens, &[bail_id, unqueried_id, bond_id]);
+        assert_eq!(d1_tokens, &[bail_id, SENTINEL_TOKEN_ID, bond_id]);
 
         let phrase = [bail_id, bond_id];
         assert!(d0_tokens.windows(2).any(|w| w == phrase));
@@ -1078,5 +1287,82 @@ PHRASE \"universal universal\"\n";
             });
         });
         assert!(res.is_err(), "Worker panic must propagate to caller!");
+    }
+
+    #[test]
+    fn test_differential_sequential_versus_parallel_ingestion() {
+        let mut docs_vec = Vec::new();
+        for i in 0..60 {
+            if i % 7 == 0 {
+                // Empty document
+                docs_vec.extend_from_slice(format!("{}\t\n", i).as_bytes());
+            } else if i % 5 == 0 {
+                docs_vec.extend_from_slice(
+                    format!("{}\tapple banana cherry apple {}\n", i, i).as_bytes(),
+                );
+            } else if i % 3 == 0 {
+                docs_vec.extend_from_slice(
+                    format!("{}\tCase 007 Zurich-bail bond, unqueried word!\n", i).as_bytes(),
+                );
+            } else {
+                docs_vec.extend_from_slice(
+                    format!("{}\tword{} another{} bail bond {}\n", i, i, i, i).as_bytes(),
+                );
+            }
+        }
+
+        let queries_vec = b"BOOL bail AND bond\n\
+BOOL apple OR cherry\n\
+BOOL zurich NOT case\n\
+BOOL 007\n\
+PHRASE \"bail bond\"\n\
+PHRASE \"apple banana cherry\"\n\
+PHRASE \"zurich bail bond\"\n";
+
+        let query_vocab = extract_query_vocab(queries_vec);
+        let seq_corpus = CorpusIndex::build_sequential(&docs_vec, &query_vocab).unwrap();
+
+        for threads in [1, 2, 3, 5, 8, 12, 16] {
+            let (par_corpus, _, _, _) =
+                CorpusIndex::build_parallel(&docs_vec, &query_vocab, threads).unwrap();
+
+            assert_eq!(seq_corpus.num_docs, par_corpus.num_docs, "threads={}", threads);
+            assert_eq!(seq_corpus.total_tokens, par_corpus.total_tokens, "threads={}", threads);
+            assert_eq!(seq_corpus.doc_offsets, par_corpus.doc_offsets, "threads={}", threads);
+            assert_eq!(seq_corpus.doc_tokens, par_corpus.doc_tokens, "threads={}", threads);
+            assert_eq!(seq_corpus.postings, par_corpus.postings, "threads={}", threads);
+        }
+    }
+
+    #[test]
+    fn test_parallel_ingestion_uneven_and_empty_chunks() {
+        // 1 document with 8 threads (more threads than docs)
+        let docs1 = b"0\tsingle doc test\n";
+        let queries1 = b"BOOL single\n";
+        let qv1 = extract_query_vocab(queries1);
+        let seq1 = CorpusIndex::build_sequential(docs1, &qv1).unwrap();
+        let (par1, _, _, _) = CorpusIndex::build_parallel(docs1, &qv1, 8).unwrap();
+        assert_eq!(seq1.doc_tokens, par1.doc_tokens);
+        assert_eq!(seq1.postings, par1.postings);
+
+        // All empty documents
+        let docs2 = b"0\t\n1\t\n2\t\n3\t\n";
+        let queries2 = b"BOOL anything\n";
+        let qv2 = extract_query_vocab(queries2);
+        let seq2 = CorpusIndex::build_sequential(docs2, &qv2).unwrap();
+        let (par2, _, _, _) = CorpusIndex::build_parallel(docs2, &qv2, 4).unwrap();
+        assert_eq!(seq2.num_docs, par2.num_docs);
+        assert_eq!(seq2.doc_tokens, par2.doc_tokens);
+        assert_eq!(seq2.postings, par2.postings);
+
+        // Uneven document lengths and trailing newlines
+        let docs3 = b"0\tshort\n1\tlong text with many words that crosses boundaries\n2\t\n3\tend\n\n";
+        let queries3 = b"BOOL short\nBOOL words\n";
+        let qv3 = extract_query_vocab(queries3);
+        let seq3 = CorpusIndex::build_sequential(docs3, &qv3).unwrap();
+        let (par3, _, _, _) = CorpusIndex::build_parallel(docs3, &qv3, 5).unwrap();
+        assert_eq!(seq3.num_docs, par3.num_docs);
+        assert_eq!(seq3.doc_tokens, par3.doc_tokens);
+        assert_eq!(seq3.postings, par3.postings);
     }
 }
