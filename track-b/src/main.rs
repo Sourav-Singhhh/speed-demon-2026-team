@@ -195,11 +195,10 @@ pub enum PostingRef<'a> {
     Dense(&'a [u64]),
 }
 
-pub struct CorpusIndex {
+pub struct CorpusIndex<'a> {
     pub num_docs: usize,
-    pub total_tokens: usize,
-    pub doc_offsets: Vec<u32>,
-    pub doc_tokens: Vec<u16>,
+    pub docs_data: &'a [u8],
+    pub doc_line_offsets: Vec<u32>,
     pub postings_offsets: Vec<u32>,
     pub postings_data: Vec<u32>,
     pub dense_bitsets: Vec<u64>,
@@ -208,7 +207,7 @@ pub struct CorpusIndex {
     pub vocab: QueryVocabularies,
 }
 
-impl CorpusIndex {
+impl<'a> CorpusIndex<'a> {
     #[inline]
     pub fn get_postings(&self, term_id: u32) -> Option<PostingRef<'_>> {
         let id = term_id as usize;
@@ -262,7 +261,7 @@ impl CorpusIndex {
         self.postings_data.len()
     }
 
-    pub fn build(docs_data: &[u8], vocab: QueryVocabularies, num_threads: usize) -> Result<Self, String> {
+    pub fn build(docs_data: &'a [u8], vocab: QueryVocabularies, num_threads: usize) -> Result<Self, String> {
         let actual_workers = num_threads.max(1);
         let chunks = partition_docs_data(docs_data, actual_workers);
         let num_terms = vocab.num_terms();
@@ -270,24 +269,25 @@ impl CorpusIndex {
         struct Pass1Result {
             first_doc_id: usize,
             num_docs: usize,
-            total_tokens: usize,
             term_counts: Vec<u32>,
+            doc_line_offsets: Vec<u32>,
         }
 
         let pass1_results: Result<Vec<Pass1Result>, String> = std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
                 let vocab_ref = &vocab;
+                let chunk_base_offset = (chunk.as_ptr() as usize).saturating_sub(docs_data.as_ptr() as usize);
                 handles.push(s.spawn(move || {
                     let mut term_counts = vec![0u32; num_terms];
                     let mut seen_epoch = vec![0u32; num_terms];
                     let mut current_epoch = 1u32;
                     let mut scratch = Vec::with_capacity(32);
+                    let mut doc_line_offsets = Vec::with_capacity(32768);
 
                     let mut pos = 0;
                     let mut first_doc_id = 0;
                     let mut num_docs = 0;
-                    let mut total_tokens = 0;
                     let mut has_first = false;
 
                     while pos < chunk.len() {
@@ -327,6 +327,9 @@ impl CorpusIndex {
                             }
                         }
 
+                        let global_line_start = (chunk_base_offset + line_start) as u32;
+                        doc_line_offsets.push(global_line_start);
+
                         let text = &line[tab_pos + 1..];
                         current_epoch += 1;
                         if current_epoch == u32::MAX {
@@ -335,7 +338,6 @@ impl CorpusIndex {
                         }
 
                         for_each_token(text, &mut scratch, |tok| {
-                            total_tokens += 1;
                             if let Some(tid) = vocab_ref.get_term_id(tok) {
                                 let idx = tid as usize;
                                 if seen_epoch[idx] != current_epoch {
@@ -351,8 +353,8 @@ impl CorpusIndex {
                     Ok(Pass1Result {
                         first_doc_id,
                         num_docs,
-                        total_tokens,
                         term_counts,
+                        doc_line_offsets,
                     })
                 }));
             }
@@ -367,23 +369,20 @@ impl CorpusIndex {
         let pass1_results = pass1_results?;
 
         let mut total_docs = 0;
-        let mut total_tokens = 0;
         let mut expected_doc = 0;
-        let mut worker_doc_starts = Vec::with_capacity(pass1_results.len());
-        let mut worker_token_starts = Vec::with_capacity(pass1_results.len());
+        let mut all_doc_offsets = Vec::with_capacity(250000);
 
         for r in &pass1_results {
-            worker_doc_starts.push(total_docs);
-            worker_token_starts.push(total_tokens);
+            all_doc_offsets.extend_from_slice(&r.doc_line_offsets);
             if r.num_docs > 0 {
                 if r.first_doc_id != expected_doc {
                     return Err(format!("doc gap: expected {}, got {}", expected_doc, r.first_doc_id));
                 }
                 expected_doc += r.num_docs;
                 total_docs += r.num_docs;
-                total_tokens += r.total_tokens;
             }
         }
+        all_doc_offsets.push(docs_data.len() as u32);
 
         let mut total_term_counts = vec![0u32; num_terms];
         for r in &pass1_results {
@@ -412,27 +411,15 @@ impl CorpusIndex {
             worker_ptrs.push(ptrs);
         }
 
-        let mut doc_offsets = vec![0u32; total_docs + 1];
-        let mut doc_tokens = vec![SENTINEL_TOKEN_ID; total_tokens];
         let mut postings_data = vec![0u32; total_postings as usize];
 
-        // PASS 2: Fill contiguous memory directly
+        // PASS 2: Fill postings memory directly
         std::thread::scope(|s| {
-            let mut doc_offsets_slice: &mut [u32] = &mut doc_offsets[..];
-            let mut doc_tokens_slice: &mut [u16] = &mut doc_tokens[..];
             let postings_ptr = postings_data.as_mut_ptr() as usize;
 
             for (w_idx, chunk) in chunks.iter().enumerate() {
-                let w_docs = pass1_results[w_idx].num_docs;
-                let w_tokens = pass1_results[w_idx].total_tokens;
-                let (w_doc_offsets, rem_docs) = doc_offsets_slice.split_at_mut(w_docs);
-                let (w_doc_tokens, rem_tokens) = doc_tokens_slice.split_at_mut(w_tokens);
-                doc_offsets_slice = rem_docs;
-                doc_tokens_slice = rem_tokens;
-
                 let vocab_ref = &vocab;
                 let mut local_postings_ptrs = std::mem::take(&mut worker_ptrs[w_idx]);
-                let token_base = worker_token_starts[w_idx] as u32;
 
                 s.spawn(move || {
                     let postings_raw = postings_ptr as *mut u32;
@@ -440,8 +427,6 @@ impl CorpusIndex {
                     let mut scratch = Vec::with_capacity(32);
 
                     let mut pos = 0;
-                    let mut local_doc_idx = 0;
-                    let mut local_token_idx = 0;
 
                     while pos < chunk.len() {
                         let line_start = pos;
@@ -476,18 +461,12 @@ impl CorpusIndex {
                         };
 
                         let text = &line[tab_pos + 1..];
-                        w_doc_offsets[local_doc_idx] = token_base + local_token_idx as u32;
                         seen_in_doc.clear();
 
                         for_each_token(text, &mut scratch, |tok| {
                             if let Some(tid) = vocab_ref.get_term_id(tok) {
-                                let pid = vocab_ref.term_to_phrase_id[tid as usize];
-                                w_doc_tokens[local_token_idx] = pid;
                                 seen_in_doc.push(tid);
-                            } else {
-                                w_doc_tokens[local_token_idx] = SENTINEL_TOKEN_ID;
                             }
-                            local_token_idx += 1;
                         });
 
                         seen_in_doc.sort_unstable();
@@ -501,14 +480,10 @@ impl CorpusIndex {
                             }
                             local_postings_ptrs[ptr_idx] += 1;
                         }
-
-                        local_doc_idx += 1;
                     }
                 });
             }
         });
-
-        doc_offsets[total_docs] = total_tokens as u32;
 
         let dense_threshold = (total_docs / 32).max(64);
         let mut dense_term_map = vec![None; num_terms];
@@ -540,9 +515,8 @@ impl CorpusIndex {
 
         Ok(Self {
             num_docs: total_docs,
-            total_tokens,
-            doc_offsets,
-            doc_tokens,
+            docs_data,
+            doc_line_offsets: all_doc_offsets,
             postings_offsets,
             postings_data,
             dense_bitsets,
@@ -728,6 +702,8 @@ pub struct QueryEvaluator {
     pub phrase_token_ids: Vec<u16>,
     pub matching_docs: Vec<u32>,
     pub sorted_and_terms: Vec<(usize, u32)>, // (cardinality, term_id)
+    pub doc_phrase_tokens: Vec<u16>,
+    pub scratch: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -830,6 +806,8 @@ impl QueryEvaluator {
             phrase_token_ids: Vec::with_capacity(16),
             matching_docs: Vec::with_capacity(1024),
             sorted_and_terms: Vec::with_capacity(8),
+            doc_phrase_tokens: Vec::with_capacity(512),
+            scratch: Vec::with_capacity(64),
         }
     }
 
@@ -1055,16 +1033,31 @@ impl QueryEvaluator {
 
                 for &doc_id in &self.candidate_docs {
                     let id = doc_id as usize;
-                    let start = corpus.doc_offsets[id] as usize;
-                    let end = corpus.doc_offsets[id + 1] as usize;
-                    let doc_slice = &corpus.doc_tokens[start..end];
+                    let line_start = corpus.doc_line_offsets[id] as usize;
+                    let line_end = if id + 1 < corpus.doc_line_offsets.len() {
+                        corpus.doc_line_offsets[id + 1] as usize
+                    } else {
+                        corpus.docs_data.len()
+                    };
+                    let line = &corpus.docs_data[line_start..line_end];
+                    let tab_pos = match line.iter().position(|&b| b == b'\t') {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let text = &line[tab_pos + 1..];
 
-                    if doc_slice.len() >= k {
+                    self.doc_phrase_tokens.clear();
+                    for_each_token(text, &mut self.scratch, |tok| {
+                        let pid = corpus.vocab.get_phrase_id(tok).unwrap_or(SENTINEL_TOKEN_ID);
+                        self.doc_phrase_tokens.push(pid);
+                    });
+
+                    if self.doc_phrase_tokens.len() >= k {
                         let mut pos = 0;
-                        let max_pos = doc_slice.len() - k;
+                        let max_pos = self.doc_phrase_tokens.len() - k;
                         let mut found = false;
                         while pos <= max_pos {
-                            if doc_slice[pos] == first_tok && &doc_slice[pos..pos + k] == target {
+                            if self.doc_phrase_tokens[pos] == first_tok && &self.doc_phrase_tokens[pos..pos + k] == target {
                                 found = true;
                                 break;
                             }
@@ -1244,21 +1237,23 @@ fn main() {
     let docs_file = fs::File::open(&docs_path).expect("failed to open docs.txt");
     let docs_len = docs_file.metadata().expect("failed to get docs metadata").len() as usize;
 
-    let corpus = if docs_len > 0 {
+    let (corpus, docs_data) = if docs_len > 0 {
         let docs_data = mmap_file(&docs_file, docs_len).expect("mmap docs.txt failed");
         let idx = CorpusIndex::build(docs_data, vocab, ingest_threads).expect("corpus index build failed");
-        munmap_file(docs_data);
-        drop(docs_file);
-        idx
+        (idx, Some(docs_data))
     } else {
-        drop(docs_file);
-        CorpusIndex::build(&[], vocab, ingest_threads).expect("corpus index build failed")
+        (CorpusIndex::build(&[], vocab, ingest_threads).expect("corpus index build failed"), None)
     };
     let t_ingest = t_ingest_start.elapsed();
 
     let t_q_start = std::time::Instant::now();
     let (results, t_bool_cpu, t_phrase_cpu) = parallel_evaluate_queries(&corpus, &parsed_queries, num_threads);
     let t_query = t_q_start.elapsed();
+
+    if let Some(data) = docs_data {
+        munmap_file(data);
+    }
+    drop(docs_file);
 
     let mut output_str = String::with_capacity(parsed_queries.len() * 32);
     for res in &results {

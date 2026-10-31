@@ -4,20 +4,21 @@ use std::path::Path;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 const UNMATCHED_COUNTRY_IDX: usize = 240;
-const TOTAL_GROUPS: usize = UNMATCHED_COUNTRY_IDX + 1; // 241 groups
-
-// 2048 words of u64 = 131,072 bits per country.
-// Dataset vocabulary is ~100,520 names, so 131,072 easily fits the entire pool.
-const WORDS_PER_COUNTRY_SHIFT: usize = 11;
-const WORDS_PER_COUNTRY: usize = 1 << WORDS_PER_COUNTRY_SHIFT; // 2048
-const MAX_NAMES_PER_BITSET: usize = WORDS_PER_COUNTRY * 64; // 131,072
 
 #[inline(always)]
 pub fn hash_name_u64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
+    let mut i = 0;
+    while i + 8 <= bytes.len() {
+        let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+        h ^= chunk;
         h = h.wrapping_mul(0x100000001b3);
+        i += 8;
+    }
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        i += 1;
     }
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51afd7ed558ccd);
@@ -27,22 +28,17 @@ pub fn hash_name_u64(bytes: &[u8]) -> u64 {
     h
 }
 
-#[inline(always)]
-fn write_cents<W: std::fmt::Write>(out: &mut W, cents: i64) {
+pub fn format_cents(cents: i64) -> String {
+    let mut out = String::with_capacity(16);
     if cents < 0 {
-        let _ = out.write_char('-');
+        out.push('-');
     }
     let abs_val: u64 = cents.unsigned_abs();
     let dollars = abs_val / 100;
     let rem = abs_val % 100;
+    use std::fmt::Write;
     let _ = write!(out, "{}.{:02}", dollars, rem);
-}
-
-#[cfg(test)]
-pub fn format_cents(cents: i64) -> String {
-    let mut s = String::new();
-    write_cents(&mut s, cents);
-    s
+    out
 }
 
 struct RegionLookup {
@@ -151,7 +147,7 @@ impl RegionLookup {
     #[inline(always)]
     fn get_country(&self, rid: usize) -> usize {
         if rid < self.region_to_country.len() {
-            self.region_to_country[rid] as usize
+            unsafe { *self.region_to_country.get_unchecked(rid) as usize }
         } else {
             UNMATCHED_COUNTRY_IDX
         }
@@ -204,8 +200,8 @@ impl NamePool {
         let cap = capacity.next_power_of_two().max(1024);
         Self {
             slots: vec![NameSlot::default(); cap],
-            arena: Vec::with_capacity(64 * 1024),
-            entries: Vec::with_capacity(1024),
+            arena: Vec::with_capacity(cap * 8),
+            entries: Vec::with_capacity(cap / 2),
             count: 0,
             mask: cap - 1,
         }
@@ -290,8 +286,7 @@ impl NamePool {
     }
 }
 
-// Plain-Old-Data CountryAgg with ZERO heap vectors!
-#[derive(Clone, Copy)]
+#[derive(Clone, Default)]
 struct CountryAgg {
     count: usize,
     id_sum: u64,
@@ -300,25 +295,24 @@ struct CountryAgg {
     amount_max: i64,
     name_bytes: u64,
     note_bytes: u64,
+    seen_names: Vec<u64>,
 }
 
-impl Default for CountryAgg {
-    fn default() -> Self {
-        Self {
-            count: 0,
-            id_sum: 0,
-            amount_sum: 0,
-            amount_min: i64::MAX,
-            amount_max: i64::MIN,
-            name_bytes: 0,
-            note_bytes: 0,
+impl CountryAgg {
+    #[inline(always)]
+    fn mark_name(&mut self, name_id: u32) {
+        let word_idx = (name_id / 64) as usize;
+        let bit_mask = 1u64 << (name_id % 64);
+        if word_idx >= self.seen_names.len() {
+            let new_len = (word_idx + 1).next_power_of_two().max(16);
+            self.seen_names.resize(new_len, 0);
         }
+        self.seen_names[word_idx] |= bit_mask;
     }
 }
 
 struct WorkerState {
-    aggs: [CountryAgg; TOTAL_GROUPS],
-    country_bits: Vec<u64>,
+    aggs: Vec<CountryAgg>,
     pool: NamePool,
 }
 
@@ -326,10 +320,13 @@ fn parse_records_chunk(
     data: &[u8],
     lookup: &RegionLookup,
 ) -> WorkerState {
-    let mut aggs = [CountryAgg::default(); TOTAL_GROUPS];
-    // Flat pre-allocated bitset: exactly one contiguous vector for all 241 countries
-    let mut country_bits = vec![0u64; TOTAL_GROUPS * WORDS_PER_COUNTRY];
-    let mut pool = NamePool::new(2048);
+    let mut aggs = vec![CountryAgg {
+        amount_min: i64::MAX,
+        amount_max: i64::MIN,
+        ..Default::default()
+    }; UNMATCHED_COUNTRY_IDX + 1];
+
+    let mut pool = NamePool::new(32768);
     let mut pos = 0;
     let end = data.len();
     let mut scratch = Vec::with_capacity(256);
@@ -346,9 +343,7 @@ fn parse_records_chunk(
         let mut id_val = 0u64;
         while pos < end && data[pos] != b',' {
             let b = data[pos];
-            if b >= b'0' && b <= b'9' {
-                id_val = id_val * 10 + (b - b'0') as u64;
-            }
+            id_val = id_val * 10 + (b - b'0') as u64;
             pos += 1;
         }
         if pos < end && data[pos] == b',' {
@@ -462,9 +457,7 @@ fn parse_records_chunk(
         let mut region_val = 0usize;
         while pos < end && data[pos] != b',' {
             let b = data[pos];
-            if b >= b'0' && b <= b'9' {
-                region_val = region_val * 10 + (b - b'0') as usize;
-            }
+            region_val = region_val * 10 + (b - b'0') as usize;
             pos += 1;
         }
         if pos < end && data[pos] == b',' {
@@ -480,9 +473,7 @@ fn parse_records_chunk(
         let mut dollars = 0i64;
         while pos < end && data[pos] != b'.' && data[pos] != b'\r' && data[pos] != b'\n' {
             let b = data[pos];
-            if b >= b'0' && b <= b'9' {
-                dollars = dollars * 10 + (b - b'0') as i64;
-            }
+            dollars = dollars * 10 + (b - b'0') as i64;
             pos += 1;
         }
         let mut cents = dollars * 100;
@@ -519,15 +510,10 @@ fn parse_records_chunk(
         }
         agg.name_bytes += name_len;
         agg.note_bytes += note_len;
-
-        // O(1) direct bitset indexing: no branch, no resize, no heap allocation
-        if (name_id as usize) < MAX_NAMES_PER_BITSET {
-            let word_offset = (country_idx << WORDS_PER_COUNTRY_SHIFT) + (name_id as usize >> 6);
-            country_bits[word_offset] |= 1u64 << (name_id & 63);
-        }
+        agg.mark_name(name_id);
     }
 
-    WorkerState { aggs, country_bits, pool }
+    WorkerState { aggs, pool }
 }
 
 fn find_chunk_boundaries(data: &[u8], num_chunks: usize) -> Vec<usize> {
@@ -704,7 +690,7 @@ fn main() {
     let t_merge_0 = std::time::Instant::now();
     // Merge into worker 0
     let mut base_state = chunk_results.swap_remove(0);
-    let mut remap_buf = Vec::with_capacity(64 * 1024);
+    let mut remap_buf = Vec::with_capacity(32 * 1024);
 
     while !chunk_results.is_empty() {
         let other_worker = chunk_results.pop().unwrap();
@@ -716,8 +702,8 @@ fn main() {
             remap_buf.push(global_id);
         }
 
-        for c in 0..TOTAL_GROUPS {
-            let other_agg = other_worker.aggs[c];
+        for c in 0..=UNMATCHED_COUNTRY_IDX {
+            let other_agg = &other_worker.aggs[c];
             if other_agg.count == 0 {
                 continue;
             }
@@ -730,26 +716,20 @@ fn main() {
             base_agg.name_bytes += other_agg.name_bytes;
             base_agg.note_bytes += other_agg.note_bytes;
 
-            let other_offset = c << WORDS_PER_COUNTRY_SHIFT;
-            let base_offset = c << WORDS_PER_COUNTRY_SHIFT;
-
-            for w in 0..WORDS_PER_COUNTRY {
-                let mut word = other_worker.country_bits[other_offset + w];
+            for (w_idx, &word) in other_agg.seen_names.iter().enumerate() {
                 if word == 0 {
                     continue;
                 }
-                let base_local_id = (w << 6) as u32;
-                while word != 0 {
-                    let trailing = word.trailing_zeros();
-                    let local_id = (base_local_id + trailing) as usize;
+                let mut bits = word;
+                let base_bit = (w_idx * 64) as u32;
+                while bits != 0 {
+                    let trailing = bits.trailing_zeros();
+                    let local_id = (base_bit + trailing) as usize;
                     if local_id < remap_buf.len() {
                         let global_id = remap_buf[local_id];
-                        if (global_id as usize) < MAX_NAMES_PER_BITSET {
-                            let g_word_idx = base_offset + (global_id as usize >> 6);
-                            base_state.country_bits[g_word_idx] |= 1u64 << (global_id & 63);
-                        }
+                        base_agg.mark_name(global_id);
                     }
-                    word &= word - 1;
+                    bits &= bits - 1;
                 }
             }
         }
@@ -759,35 +739,28 @@ fn main() {
 
     let t_out_0 = std::time::Instant::now();
     // Format output
-    use std::fmt::Write;
     let mut out_buf = String::with_capacity(32 * 1024);
     for (i, code) in lookup.countries.iter().enumerate() {
         let agg = &base_state.aggs[i];
         if agg.count == 0 {
             continue;
         }
-        let offset = i << WORDS_PER_COUNTRY_SHIFT;
-        let distinct: u64 = base_state.country_bits[offset..offset + WORDS_PER_COUNTRY]
-            .iter()
-            .map(|&w| w.count_ones() as u64)
-            .sum();
-
+        let distinct: u64 = agg.seen_names.iter().map(|&w| w.count_ones() as u64).sum();
         let country_str = unsafe { std::str::from_utf8_unchecked(code) };
-        let _ = write!(
-            out_buf,
-            "{} {} {} ",
-            country_str,
-            agg.count,
-            agg.id_sum
-        );
-        write_cents(&mut out_buf, agg.amount_sum);
-        let _ = out_buf.write_char(' ');
-        write_cents(&mut out_buf, agg.amount_min);
-        let _ = out_buf.write_char(' ');
-        write_cents(&mut out_buf, agg.amount_max);
+        let min_str = format_cents(agg.amount_min);
+        let max_str = format_cents(agg.amount_max);
+        let sum_str = format_cents(agg.amount_sum);
+
+        use std::fmt::Write;
         let _ = writeln!(
             out_buf,
-            " {} {} {}",
+            "{} {} {} {} {} {} {} {} {}",
+            country_str,
+            agg.count,
+            agg.id_sum,
+            sum_str,
+            min_str,
+            max_str,
             distinct,
             agg.name_bytes,
             agg.note_bytes
@@ -796,26 +769,20 @@ fn main() {
 
     let agg = &base_state.aggs[UNMATCHED_COUNTRY_IDX];
     if agg.count > 0 {
-        let offset = UNMATCHED_COUNTRY_IDX << WORDS_PER_COUNTRY_SHIFT;
-        let distinct: u64 = base_state.country_bits[offset..offset + WORDS_PER_COUNTRY]
-            .iter()
-            .map(|&w| w.count_ones() as u64)
-            .sum();
+        let distinct: u64 = agg.seen_names.iter().map(|&w| w.count_ones() as u64).sum();
+        let min_str = format_cents(agg.amount_min);
+        let max_str = format_cents(agg.amount_max);
+        let sum_str = format_cents(agg.amount_sum);
 
-        let _ = write!(
-            out_buf,
-            "_UNMATCHED {} {} ",
-            agg.count,
-            agg.id_sum
-        );
-        write_cents(&mut out_buf, agg.amount_sum);
-        let _ = out_buf.write_char(' ');
-        write_cents(&mut out_buf, agg.amount_min);
-        let _ = out_buf.write_char(' ');
-        write_cents(&mut out_buf, agg.amount_max);
+        use std::fmt::Write;
         let _ = writeln!(
             out_buf,
-            " {} {} {}",
+            "_UNMATCHED {} {} {} {} {} {} {} {}",
+            agg.count,
+            agg.id_sum,
+            sum_str,
+            min_str,
+            max_str,
             distinct,
             agg.name_bytes,
             agg.note_bytes
@@ -888,15 +855,14 @@ mod tests {
 
     #[test]
     fn test_country_agg_bitset() {
-        let mut country_bits = vec![0u64; TOTAL_GROUPS * WORDS_PER_COUNTRY];
-        let country_idx = 5;
-        for &nid in &[0u32, 63, 64, 127, 0] {
-            let word_offset = (country_idx << WORDS_PER_COUNTRY_SHIFT) + (nid as usize >> 6);
-            country_bits[word_offset] |= 1u64 << (nid & 63);
-        }
-        let start = country_idx << WORDS_PER_COUNTRY_SHIFT;
-        let end = start + WORDS_PER_COUNTRY;
-        let distinct: u64 = country_bits[start..end].iter().map(|&w| w.count_ones() as u64).sum();
+        let mut agg = CountryAgg::default();
+        agg.mark_name(0);
+        agg.mark_name(63);
+        agg.mark_name(64);
+        agg.mark_name(127);
+        agg.mark_name(0); // duplicate
+
+        let distinct: u64 = agg.seen_names.iter().map(|&w| w.count_ones() as u64).sum();
         assert_eq!(distinct, 4);
     }
 }
