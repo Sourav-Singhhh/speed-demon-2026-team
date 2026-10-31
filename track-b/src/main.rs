@@ -4,6 +4,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 #[inline]
 pub fn is_token_byte(b: u8) -> bool {
@@ -50,84 +51,457 @@ pub fn tokenize(text: &[u8]) -> Vec<Vec<u8>> {
     tokens
 }
 
-pub fn extract_query_vocab(queries_data: &[u8]) -> HashSet<Vec<u8>> {
-    let mut vocab = HashSet::new();
-    for line in queries_data.split(|&b| b == b'\n') {
-        let line = if line.ends_with(b"\r") {
-            &line[..line.len() - 1]
-        } else {
-            line
-        };
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with(b"BOOL ") {
-            let rest = &line[5..];
-            for part in rest.split(|&b| b == b' ') {
-                if part != b"AND" && part != b"OR" && part != b"NOT" && !part.is_empty() {
-                    vocab.insert(part.to_vec());
-                }
-            }
-        } else if line.starts_with(b"PHRASE \"") && line.ends_with(b"\"") && line.len() >= 9 {
-            let inner = &line[8..line.len() - 1];
-            for term in inner.split(|&b| b == b' ') {
-                if !term.is_empty() {
-                    vocab.insert(term.to_vec());
-                }
-            }
-        }
-    }
-    vocab
+pub const SENTINEL_TOKEN_ID: u16 = 0xFFFF;
+
+pub struct QueryVocabularies {
+    pub all_terms_map: HashMap<Vec<u8>, u32>,
+    pub phrase_terms_map: HashMap<Vec<u8>, u16>,
+    pub term_to_phrase_id: Vec<u16>,
 }
 
-pub const SENTINEL_TOKEN_ID: u32 = u32::MAX;
+impl QueryVocabularies {
+    pub fn extract(queries_data: &[u8]) -> Self {
+        let mut all_set = HashSet::new();
+        let mut phrase_set = HashSet::new();
 
-pub struct VocabTable {
-    pub map: HashMap<Vec<u8>, u32>,
-    pub tokens: Vec<Vec<u8>>,
-}
-
-impl VocabTable {
-    pub fn from_query_vocab(query_vocab: &HashSet<Vec<u8>>) -> Self {
-        let mut sorted: Vec<Vec<u8>> = query_vocab.iter().cloned().collect();
-        sorted.sort_unstable();
-        let mut map = HashMap::with_capacity(sorted.len());
-        let mut tokens = Vec::with_capacity(sorted.len());
-        for (id, tok) in sorted.into_iter().enumerate() {
-            map.insert(tok.clone(), id as u32);
-            tokens.push(tok);
+        for line in queries_data.split(|&b| b == b'\n') {
+            let line = if line.ends_with(b"\r") {
+                &line[..line.len() - 1]
+            } else {
+                line
+            };
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with(b"BOOL ") {
+                let rest = &line[5..];
+                for part in rest.split(|&b| b == b' ') {
+                    if part != b"AND" && part != b"OR" && part != b"NOT" && !part.is_empty() {
+                        all_set.insert(part.to_vec());
+                    }
+                }
+            } else if line.starts_with(b"PHRASE \"") && line.ends_with(b"\"") && line.len() >= 9 {
+                let inner = &line[8..line.len() - 1];
+                for term in inner.split(|&b| b == b' ') {
+                    if !term.is_empty() {
+                        all_set.insert(term.to_vec());
+                        phrase_set.insert(term.to_vec());
+                    }
+                }
+            }
         }
-        Self { map, tokens }
+
+        let mut sorted_all: Vec<Vec<u8>> = all_set.into_iter().collect();
+        sorted_all.sort_unstable();
+
+        let mut sorted_phrase: Vec<Vec<u8>> = phrase_set.into_iter().collect();
+        sorted_phrase.sort_unstable();
+        assert!(
+            sorted_phrase.len() < SENTINEL_TOKEN_ID as usize,
+            "Phrase vocabulary exceeds u16 limit!"
+        );
+
+        let mut phrase_terms_map = HashMap::with_capacity(sorted_phrase.len());
+        for (id, tok) in sorted_phrase.into_iter().enumerate() {
+            phrase_terms_map.insert(tok, id as u16);
+        }
+
+        let mut all_terms_map = HashMap::with_capacity(sorted_all.len());
+        let mut term_to_phrase_id = Vec::with_capacity(sorted_all.len());
+
+        for (id, tok) in sorted_all.into_iter().enumerate() {
+            let pid = phrase_terms_map
+                .get(&tok)
+                .copied()
+                .unwrap_or(SENTINEL_TOKEN_ID);
+            all_terms_map.insert(tok, id as u32);
+            term_to_phrase_id.push(pid);
+        }
+
+        Self {
+            all_terms_map,
+            phrase_terms_map,
+            term_to_phrase_id,
+        }
     }
 
     #[inline]
-    pub fn get_id(&self, token: &[u8]) -> Option<u32> {
-        self.map.get(token).copied()
+    pub fn get_term_id(&self, tok: &[u8]) -> Option<u32> {
+        self.all_terms_map.get(tok).copied()
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
-        self.tokens.len()
+    pub fn get_phrase_id(&self, tok: &[u8]) -> Option<u16> {
+        self.phrase_terms_map.get(tok).copied()
     }
+
+    #[inline]
+    pub fn num_terms(&self) -> usize {
+        self.all_terms_map.len()
+    }
+}
+
+pub enum PostingRef<'a> {
+    Sparse(&'a [u32]),
+    Dense(&'a [u64]),
 }
 
 pub struct CorpusIndex {
     pub num_docs: usize,
     pub total_tokens: usize,
     pub doc_offsets: Vec<u32>,
-    pub doc_tokens: Vec<u32>,
-    pub postings: HashMap<u32, Vec<u32>>,
-    pub vocab: VocabTable,
-    pub query_vocab_size: usize,
+    pub doc_tokens: Vec<u16>,
+    pub postings_offsets: Vec<u32>,
+    pub postings_data: Vec<u32>,
+    pub dense_bitsets: Vec<u64>,
+    pub dense_term_map: Vec<Option<u32>>,
+    pub words_per_bitset: usize,
+    pub vocab: QueryVocabularies,
 }
 
-pub struct WorkerChunkResult {
-    pub first_doc_id: usize,
-    pub num_docs: usize,
-    pub total_tokens: usize,
-    pub doc_offsets: Vec<u32>,
-    pub doc_tokens: Vec<u32>,
-    pub postings: HashMap<u32, Vec<u32>>,
+impl CorpusIndex {
+    #[inline]
+    pub fn get_postings(&self, term_id: u32) -> Option<PostingRef<'_>> {
+        let id = term_id as usize;
+        if id < self.dense_term_map.len() {
+            if let Some(dense_idx) = self.dense_term_map[id] {
+                let start = dense_idx as usize * self.words_per_bitset;
+                let end = start + self.words_per_bitset;
+                return Some(PostingRef::Dense(&self.dense_bitsets[start..end]));
+            }
+        }
+        if id + 1 < self.postings_offsets.len() {
+            let start = self.postings_offsets[id] as usize;
+            let end = self.postings_offsets[id + 1] as usize;
+            if start < end {
+                Some(PostingRef::Sparse(&self.postings_data[start..end]))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn get_sparse_postings(&self, term_id: u32) -> Option<&[u32]> {
+        let id = term_id as usize;
+        if id + 1 < self.postings_offsets.len() {
+            let start = self.postings_offsets[id] as usize;
+            let end = self.postings_offsets[id + 1] as usize;
+            if start < end {
+                Some(&self.postings_data[start..end])
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn get_posting_len(&self, term_id: u32) -> usize {
+        let id = term_id as usize;
+        if id + 1 < self.postings_offsets.len() {
+            (self.postings_offsets[id + 1] - self.postings_offsets[id]) as usize
+        } else {
+            0
+        }
+    }
+
+    pub fn retained_postings_count(&self) -> usize {
+        self.postings_data.len()
+    }
+
+    pub fn build(docs_data: &[u8], vocab: QueryVocabularies, num_threads: usize) -> Result<Self, String> {
+        let actual_workers = num_threads.max(1);
+        let chunks = partition_docs_data(docs_data, actual_workers);
+        let num_terms = vocab.num_terms();
+
+        struct Pass1Result {
+            first_doc_id: usize,
+            num_docs: usize,
+            total_tokens: usize,
+            term_counts: Vec<u32>,
+        }
+
+        let pass1_results: Result<Vec<Pass1Result>, String> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(chunks.len());
+            for chunk in &chunks {
+                let vocab_ref = &vocab;
+                handles.push(s.spawn(move || {
+                    let mut term_counts = vec![0u32; num_terms];
+                    let mut seen_epoch = vec![0u32; num_terms];
+                    let mut current_epoch = 1u32;
+                    let mut scratch = Vec::with_capacity(32);
+
+                    let mut pos = 0;
+                    let mut first_doc_id = 0;
+                    let mut num_docs = 0;
+                    let mut total_tokens = 0;
+                    let mut has_first = false;
+
+                    while pos < chunk.len() {
+                        let line_start = pos;
+                        while pos < chunk.len() && chunk[pos] != b'\n' {
+                            pos += 1;
+                        }
+                        let mut line_end = pos;
+                        if pos < chunk.len() && chunk[pos] == b'\n' {
+                            pos += 1;
+                        }
+                        if line_end > line_start && chunk[line_end - 1] == b'\r' {
+                            line_end -= 1;
+                        }
+                        let line = &chunk[line_start..line_end];
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        let tab_pos = line
+                            .iter()
+                            .position(|&b| b == b'\t')
+                            .ok_or_else(|| "missing TAB in doc line".to_string())?;
+
+                        let id_bytes = &line[..tab_pos];
+                        let id_str = std::str::from_utf8(id_bytes).map_err(|e| e.to_string())?;
+                        let doc_id: usize =
+                            id_str.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+
+                        if !has_first {
+                            first_doc_id = doc_id;
+                            has_first = true;
+                        } else {
+                            let expected = first_doc_id + num_docs;
+                            if doc_id != expected {
+                                return Err(format!("expected doc id {}, got {}", expected, doc_id));
+                            }
+                        }
+
+                        let text = &line[tab_pos + 1..];
+                        current_epoch += 1;
+                        if current_epoch == u32::MAX {
+                            seen_epoch.fill(0);
+                            current_epoch = 1;
+                        }
+
+                        for_each_token(text, &mut scratch, |tok| {
+                            total_tokens += 1;
+                            if let Some(tid) = vocab_ref.get_term_id(tok) {
+                                let idx = tid as usize;
+                                if seen_epoch[idx] != current_epoch {
+                                    seen_epoch[idx] = current_epoch;
+                                    term_counts[idx] += 1;
+                                }
+                            }
+                        });
+
+                        num_docs += 1;
+                    }
+
+                    Ok(Pass1Result {
+                        first_doc_id,
+                        num_docs,
+                        total_tokens,
+                        term_counts,
+                    })
+                }));
+            }
+
+            let mut res = Vec::with_capacity(handles.len());
+            for h in handles {
+                res.push(h.join().unwrap()?);
+            }
+            Ok(res)
+        });
+
+        let pass1_results = pass1_results?;
+
+        let mut total_docs = 0;
+        let mut total_tokens = 0;
+        let mut expected_doc = 0;
+        let mut worker_doc_starts = Vec::with_capacity(pass1_results.len());
+        let mut worker_token_starts = Vec::with_capacity(pass1_results.len());
+
+        for r in &pass1_results {
+            worker_doc_starts.push(total_docs);
+            worker_token_starts.push(total_tokens);
+            if r.num_docs > 0 {
+                if r.first_doc_id != expected_doc {
+                    return Err(format!("doc gap: expected {}, got {}", expected_doc, r.first_doc_id));
+                }
+                expected_doc += r.num_docs;
+                total_docs += r.num_docs;
+                total_tokens += r.total_tokens;
+            }
+        }
+
+        let mut total_term_counts = vec![0u32; num_terms];
+        for r in &pass1_results {
+            for (i, &cnt) in r.term_counts.iter().enumerate() {
+                total_term_counts[i] += cnt;
+            }
+        }
+
+        let mut postings_offsets = Vec::with_capacity(num_terms + 1);
+        postings_offsets.push(0);
+        let mut total_postings = 0u32;
+        for &cnt in &total_term_counts {
+            total_postings += cnt;
+            postings_offsets.push(total_postings);
+        }
+
+        let mut worker_ptrs: Vec<Vec<u32>> = Vec::with_capacity(pass1_results.len());
+        let mut running_worker_starts = vec![0u32; num_terms];
+
+        for w in 0..pass1_results.len() {
+            let mut ptrs = Vec::with_capacity(num_terms);
+            for t in 0..num_terms {
+                ptrs.push(postings_offsets[t] + running_worker_starts[t]);
+                running_worker_starts[t] += pass1_results[w].term_counts[t];
+            }
+            worker_ptrs.push(ptrs);
+        }
+
+        let mut doc_offsets = vec![0u32; total_docs + 1];
+        let mut doc_tokens = vec![SENTINEL_TOKEN_ID; total_tokens];
+        let mut postings_data = vec![0u32; total_postings as usize];
+
+        // PASS 2: Fill contiguous memory directly
+        std::thread::scope(|s| {
+            let mut doc_offsets_slice: &mut [u32] = &mut doc_offsets[..];
+            let mut doc_tokens_slice: &mut [u16] = &mut doc_tokens[..];
+            let postings_ptr = postings_data.as_mut_ptr() as usize;
+
+            for (w_idx, chunk) in chunks.iter().enumerate() {
+                let w_docs = pass1_results[w_idx].num_docs;
+                let w_tokens = pass1_results[w_idx].total_tokens;
+                let (w_doc_offsets, rem_docs) = doc_offsets_slice.split_at_mut(w_docs);
+                let (w_doc_tokens, rem_tokens) = doc_tokens_slice.split_at_mut(w_tokens);
+                doc_offsets_slice = rem_docs;
+                doc_tokens_slice = rem_tokens;
+
+                let vocab_ref = &vocab;
+                let mut local_postings_ptrs = std::mem::take(&mut worker_ptrs[w_idx]);
+                let token_base = worker_token_starts[w_idx] as u32;
+
+                s.spawn(move || {
+                    let postings_raw = postings_ptr as *mut u32;
+                    let mut seen_in_doc = Vec::with_capacity(256);
+                    let mut scratch = Vec::with_capacity(32);
+
+                    let mut pos = 0;
+                    let mut local_doc_idx = 0;
+                    let mut local_token_idx = 0;
+
+                    while pos < chunk.len() {
+                        let line_start = pos;
+                        while pos < chunk.len() && chunk[pos] != b'\n' {
+                            pos += 1;
+                        }
+                        let mut line_end = pos;
+                        if pos < chunk.len() && chunk[pos] == b'\n' {
+                            pos += 1;
+                        }
+                        if line_end > line_start && chunk[line_end - 1] == b'\r' {
+                            line_end -= 1;
+                        }
+                        let line = &chunk[line_start..line_end];
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        let tab_pos = match line.iter().position(|&b| b == b'\t') {
+                            Some(p) => p,
+                            None => continue,
+                        };
+
+                        let id_bytes = &line[..tab_pos];
+                        let id_str = match std::str::from_utf8(id_bytes) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        let doc_id: u32 = match id_str.parse() {
+                            Ok(id) => id,
+                            Err(_) => continue,
+                        };
+
+                        let text = &line[tab_pos + 1..];
+                        w_doc_offsets[local_doc_idx] = token_base + local_token_idx as u32;
+                        seen_in_doc.clear();
+
+                        for_each_token(text, &mut scratch, |tok| {
+                            if let Some(tid) = vocab_ref.get_term_id(tok) {
+                                let pid = vocab_ref.term_to_phrase_id[tid as usize];
+                                w_doc_tokens[local_token_idx] = pid;
+                                seen_in_doc.push(tid);
+                            } else {
+                                w_doc_tokens[local_token_idx] = SENTINEL_TOKEN_ID;
+                            }
+                            local_token_idx += 1;
+                        });
+
+                        seen_in_doc.sort_unstable();
+                        seen_in_doc.dedup();
+
+                        for &tid in &seen_in_doc {
+                            let ptr_idx = tid as usize;
+                            let out_pos = local_postings_ptrs[ptr_idx] as usize;
+                            unsafe {
+                                *postings_raw.add(out_pos) = doc_id;
+                            }
+                            local_postings_ptrs[ptr_idx] += 1;
+                        }
+
+                        local_doc_idx += 1;
+                    }
+                });
+            }
+        });
+
+        doc_offsets[total_docs] = total_tokens as u32;
+
+        let dense_threshold = (total_docs / 32).max(64);
+        let mut dense_term_map = vec![None; num_terms];
+        let mut num_dense = 0;
+        for (tid, &count) in total_term_counts.iter().enumerate() {
+            if count as usize >= dense_threshold {
+                dense_term_map[tid] = Some(num_dense as u32);
+                num_dense += 1;
+            }
+        }
+
+        let words_per_bitset = (total_docs + 63) / 64;
+        let mut dense_bitsets = vec![0u64; num_dense * words_per_bitset];
+
+        for (tid, &dense_idx_opt) in dense_term_map.iter().enumerate() {
+            if let Some(d_idx) = dense_idx_opt {
+                let start_word = d_idx as usize * words_per_bitset;
+                let post_start = postings_offsets[tid] as usize;
+                let post_end = postings_offsets[tid + 1] as usize;
+                let slice = &postings_data[post_start..post_end];
+                for &doc_id in slice {
+                    let id = doc_id as usize;
+                    if id < total_docs {
+                        dense_bitsets[start_word + (id / 64)] |= 1u64 << (id % 64);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            num_docs: total_docs,
+            total_tokens,
+            doc_offsets,
+            doc_tokens,
+            postings_offsets,
+            postings_data,
+            dense_bitsets,
+            dense_term_map,
+            words_per_bitset,
+            vocab,
+        })
+    }
 }
 
 pub fn partition_docs_data(docs_data: &[u8], num_chunks: usize) -> Vec<&[u8]> {
@@ -163,253 +537,10 @@ pub fn partition_docs_data(docs_data: &[u8], num_chunks: usize) -> Vec<&[u8]> {
     chunks
 }
 
-pub fn parse_doc_chunk(chunk: &[u8], vocab: &VocabTable) -> Result<WorkerChunkResult, String> {
-    if chunk.is_empty() {
-        return Ok(WorkerChunkResult {
-            first_doc_id: 0,
-            num_docs: 0,
-            total_tokens: 0,
-            doc_offsets: vec![0],
-            doc_tokens: Vec::new(),
-            postings: HashMap::new(),
-        });
-    }
-
-    let approx_docs = (chunk.len() / 80).max(64);
-    let mut doc_offsets = Vec::with_capacity(approx_docs + 1);
-    let mut doc_tokens = Vec::with_capacity(approx_docs * 20);
-    let mut postings: HashMap<u32, Vec<u32>> = HashMap::with_capacity(vocab.len().min(4096));
-    let mut scratch = Vec::with_capacity(32);
-    let mut seen_in_doc: Vec<u32> = Vec::with_capacity(256);
-
-    let mut pos = 0;
-    let mut first_doc_id = 0;
-    let mut num_docs = 0;
-    let mut total_tokens = 0;
-    let mut has_first_doc = false;
-
-    while pos < chunk.len() {
-        let line_start = pos;
-        while pos < chunk.len() && chunk[pos] != b'\n' {
-            pos += 1;
-        }
-        let mut line_end = pos;
-        if pos < chunk.len() && chunk[pos] == b'\n' {
-            pos += 1;
-        }
-        if line_end > line_start && chunk[line_end - 1] == b'\r' {
-            line_end -= 1;
-        }
-        let line = &chunk[line_start..line_end];
-        if line.is_empty() {
-            continue;
-        }
-
-        let tab_pos = line
-            .iter()
-            .position(|&b| b == b'\t')
-            .ok_or_else(|| "missing TAB in doc line".to_string())?;
-
-        let id_bytes = &line[..tab_pos];
-        let id_str = std::str::from_utf8(id_bytes).map_err(|e| e.to_string())?;
-        let doc_id: usize = id_str.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
-
-        if !has_first_doc {
-            first_doc_id = doc_id;
-            has_first_doc = true;
-        } else {
-            let expected_id = first_doc_id + num_docs;
-            if doc_id != expected_id {
-                return Err(format!("expected doc id {}, got {}", expected_id, doc_id));
-            }
-        }
-
-        let text = &line[tab_pos + 1..];
-        doc_offsets.push(doc_tokens.len() as u32);
-        seen_in_doc.clear();
-
-        for_each_token(text, &mut scratch, |tok| {
-            total_tokens += 1;
-            if let Some(token_id) = vocab.get_id(tok) {
-                doc_tokens.push(token_id);
-                seen_in_doc.push(token_id);
-            } else {
-                doc_tokens.push(SENTINEL_TOKEN_ID);
-            }
-        });
-
-        seen_in_doc.sort_unstable();
-        seen_in_doc.dedup();
-
-        for &token_id in &seen_in_doc {
-            postings
-                .entry(token_id)
-                .or_insert_with(Vec::new)
-                .push(doc_id as u32);
-        }
-
-        num_docs += 1;
-    }
-
-    doc_offsets.push(doc_tokens.len() as u32);
-
-    Ok(WorkerChunkResult {
-        first_doc_id,
-        num_docs,
-        total_tokens,
-        doc_offsets,
-        doc_tokens,
-        postings,
-    })
-}
-
-impl CorpusIndex {
-    pub fn build_sequential(docs_data: &[u8], query_vocab: &HashSet<Vec<u8>>) -> Result<Self, String> {
-        let vocab = VocabTable::from_query_vocab(query_vocab);
-        let worker_res = parse_doc_chunk(docs_data, &vocab)?;
-        Ok(Self {
-            num_docs: worker_res.num_docs,
-            total_tokens: worker_res.total_tokens,
-            doc_offsets: worker_res.doc_offsets,
-            doc_tokens: worker_res.doc_tokens,
-            postings: worker_res.postings,
-            vocab,
-            query_vocab_size: query_vocab.len(),
-        })
-    }
-
-    pub fn build_parallel(
-        docs_data: &[u8],
-        query_vocab: &HashSet<Vec<u8>>,
-        num_threads: usize,
-    ) -> Result<(Self, std::time::Duration, std::time::Duration, Vec<usize>), String> {
-        let vocab = VocabTable::from_query_vocab(query_vocab);
-        let actual_workers = num_threads.max(1);
-
-        let t_workers_start = std::time::Instant::now();
-        let chunks = partition_docs_data(docs_data, actual_workers);
-
-        let worker_results: Result<Vec<WorkerChunkResult>, String> = std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(chunks.len());
-            for chunk in chunks {
-                let vocab_ref = &vocab;
-                handles.push(s.spawn(move || parse_doc_chunk(chunk, vocab_ref)));
-            }
-
-            let mut results = Vec::with_capacity(handles.len());
-            for h in handles {
-                match h.join() {
-                    Ok(res) => match res {
-                        Ok(w) => results.push(w),
-                        Err(e) => return Err(e),
-                    },
-                    Err(panic_err) => {
-                        std::panic::resume_unwind(panic_err);
-                    }
-                }
-            }
-            Ok(results)
-        });
-
-        let mut worker_results = worker_results?;
-        let t_workers = t_workers_start.elapsed();
-
-        let t_merge_start = std::time::Instant::now();
-        let mut total_docs = 0;
-        let mut total_tokens = 0;
-        let mut total_doc_tokens = 0;
-        let mut expected_doc_id = 0;
-        let mut worker_doc_counts = Vec::with_capacity(worker_results.len());
-
-        for w in &worker_results {
-            worker_doc_counts.push(w.num_docs);
-            if w.num_docs > 0 {
-                if w.first_doc_id != expected_doc_id {
-                    return Err(format!(
-                        "worker document gap: expected doc {}, got {}",
-                        expected_doc_id, w.first_doc_id
-                    ));
-                }
-                expected_doc_id += w.num_docs;
-                total_docs += w.num_docs;
-                total_tokens += w.total_tokens;
-                total_doc_tokens += w.doc_tokens.len();
-            }
-        }
-
-        let mut merged_doc_tokens = Vec::with_capacity(total_doc_tokens);
-        let mut merged_doc_offsets = Vec::with_capacity(total_docs + 1);
-        merged_doc_offsets.push(0);
-
-        let mut token_base: u32 = 0;
-        for w in &mut worker_results {
-            if w.num_docs == 0 {
-                continue;
-            }
-            for &off in &w.doc_offsets[1..] {
-                merged_doc_offsets.push(token_base + off);
-            }
-            token_base += w.doc_tokens.len() as u32;
-            merged_doc_tokens.append(&mut w.doc_tokens);
-            w.doc_tokens = Vec::new();
-            w.doc_offsets = Vec::new();
-        }
-
-        let mut term_lengths: HashMap<u32, usize> = HashMap::with_capacity(vocab.len());
-        for w in &worker_results {
-            for (&token_id, list) in &w.postings {
-                *term_lengths.entry(token_id).or_insert(0) += list.len();
-            }
-        }
-
-        let mut merged_postings: HashMap<u32, Vec<u32>> = HashMap::with_capacity(term_lengths.len());
-        for (&token_id, &total_len) in &term_lengths {
-            merged_postings.insert(token_id, Vec::with_capacity(total_len));
-        }
-
-        for w in &mut worker_results {
-            for (token_id, list) in w.postings.drain() {
-                if let Some(target) = merged_postings.get_mut(&token_id) {
-                    target.extend(list);
-                }
-            }
-        }
-        let t_merge = t_merge_start.elapsed();
-
-        let corpus = Self {
-            num_docs: total_docs,
-            total_tokens,
-            doc_offsets: merged_doc_offsets,
-            doc_tokens: merged_doc_tokens,
-            postings: merged_postings,
-            vocab,
-            query_vocab_size: query_vocab.len(),
-        };
-
-        Ok((corpus, t_workers, t_merge, worker_doc_counts))
-    }
-
-    pub fn build(docs_data: &[u8], query_vocab: &HashSet<Vec<u8>>) -> Result<Self, String> {
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        if num_threads <= 1 {
-            Self::build_sequential(docs_data, query_vocab)
-        } else {
-            Self::build_parallel(docs_data, query_vocab, num_threads).map(|(c, _, _, _)| c)
-        }
-    }
-
-    pub fn retained_postings_count(&self) -> usize {
-        self.postings.values().map(|p| p.len()).sum()
-    }
-}
-
-
 #[derive(Clone)]
 pub struct BitSet {
-    words: Vec<u64>,
-    num_docs: usize,
+    pub words: Vec<u64>,
+    pub num_docs: usize,
 }
 
 impl BitSet {
@@ -427,52 +558,74 @@ impl BitSet {
     }
 
     #[inline]
-    pub fn set_all(&mut self) {
-        self.words.fill(u64::MAX);
-        // Clear padding bits beyond num_docs
-        let remainder = self.num_docs % 64;
-        if remainder != 0 {
-            let last_idx = self.words.len() - 1;
-            let mask = (1u64 << remainder) - 1;
-            self.words[last_idx] &= mask;
-        }
-    }
-
-    #[inline]
-    pub fn load_postings(&mut self, postings: Option<&[u32]>) {
+    pub fn load_sparse(&mut self, list: &[u32]) {
         self.clear();
-        if let Some(list) = postings {
-            for &doc_id in list {
-                let id = doc_id as usize;
-                if id < self.num_docs {
-                    self.words[id / 64] |= 1u64 << (id % 64);
-                }
+        for &doc_id in list {
+            let id = doc_id as usize;
+            if id < self.num_docs {
+                self.words[id / 64] |= 1u64 << (id % 64);
             }
         }
     }
 
     #[inline]
-    pub fn union_postings(&mut self, postings: Option<&[u32]>) {
-        if let Some(list) = postings {
-            for &doc_id in list {
-                let id = doc_id as usize;
-                if id < self.num_docs {
-                    self.words[id / 64] |= 1u64 << (id % 64);
-                }
+    pub fn load_dense(&mut self, dense_words: &[u64]) {
+        self.words.copy_from_slice(dense_words);
+    }
+
+    #[inline]
+    pub fn union_sparse(&mut self, list: &[u32]) {
+        for &doc_id in list {
+            let id = doc_id as usize;
+            if id < self.num_docs {
+                self.words[id / 64] |= 1u64 << (id % 64);
             }
         }
     }
 
     #[inline]
-    pub fn intersect_with(&mut self, other: &BitSet) {
-        for (w1, w2) in self.words.iter_mut().zip(&other.words) {
+    pub fn union_dense(&mut self, dense_words: &[u64]) {
+        for (w1, w2) in self.words.iter_mut().zip(dense_words) {
+            *w1 |= *w2;
+        }
+    }
+
+    #[inline]
+    pub fn intersect_with_sparse(&mut self, list: &[u32]) {
+        let mut new_words = vec![0u64; self.words.len()];
+        for &doc_id in list {
+            let id = doc_id as usize;
+            if id < self.num_docs {
+                let w_idx = id / 64;
+                let bit = 1u64 << (id % 64);
+                if (self.words[w_idx] & bit) != 0 {
+                    new_words[w_idx] |= bit;
+                }
+            }
+        }
+        self.words = new_words;
+    }
+
+    #[inline]
+    pub fn intersect_with_dense(&mut self, dense_words: &[u64]) {
+        for (w1, w2) in self.words.iter_mut().zip(dense_words) {
             *w1 &= *w2;
         }
     }
 
     #[inline]
-    pub fn difference_with(&mut self, other: &BitSet) {
-        for (w1, w2) in self.words.iter_mut().zip(&other.words) {
+    pub fn difference_with_sparse(&mut self, list: &[u32]) {
+        for &doc_id in list {
+            let id = doc_id as usize;
+            if id < self.num_docs {
+                self.words[id / 64] &= !(1u64 << (id % 64));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn difference_with_dense(&mut self, dense_words: &[u64]) {
+        for (w1, w2) in self.words.iter_mut().zip(dense_words) {
             *w1 &= !*w2;
         }
     }
@@ -499,7 +652,7 @@ impl BitSet {
                 if first_10.len() < 10 {
                     first_10.push(doc_id as u32);
                 }
-                w &= w - 1; // Clear lowest set bit
+                w &= w - 1;
             }
         }
         (count, sum, first_10)
@@ -519,11 +672,11 @@ fn format_result_into(count: usize, sum: u64, first_10: &[u32], output: &mut Str
 }
 
 pub struct QueryEvaluator {
-    pub bitset_res: BitSet,
-    pub bitset_tmp: BitSet,
+    pub bitset: BitSet,
     pub candidate_docs: Vec<u32>,
-    pub phrase_token_ids: Vec<u32>,
+    pub phrase_token_ids: Vec<u16>,
     pub matching_docs: Vec<u32>,
+    pub sorted_and_terms: Vec<(usize, u32)>, // (cardinality, term_id)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -621,11 +774,11 @@ pub fn parse_all_queries(queries_data: &[u8]) -> Vec<ParsedQuery> {
 impl QueryEvaluator {
     pub fn new(num_docs: usize) -> Self {
         Self {
-            bitset_res: BitSet::new(num_docs),
-            bitset_tmp: BitSet::new(num_docs),
+            bitset: BitSet::new(num_docs),
             candidate_docs: Vec::with_capacity(1024),
             phrase_token_ids: Vec::with_capacity(16),
             matching_docs: Vec::with_capacity(1024),
+            sorted_and_terms: Vec::with_capacity(8),
         }
     }
 
@@ -640,32 +793,140 @@ impl QueryEvaluator {
                 first_term,
                 clauses,
             } => {
-                let first_id = corpus.vocab.get_id(first_term);
-                let first_postings =
-                    first_id.and_then(|id| corpus.postings.get(&id).map(|v| &v[..]));
-                self.bitset_res.load_postings(first_postings);
+                let is_pure_and = clauses.iter().all(|(op, _)| *op == BoolOp::And);
 
-                for (op, term) in clauses {
-                    let term_id = corpus.vocab.get_id(term);
-                    let term_postings =
-                        term_id.and_then(|id| corpus.postings.get(&id).map(|v| &v[..]));
+                if is_pure_and {
+                    // PLANNER OPTIMIZATION: Collect all terms, sort by cardinality (rarest first)
+                    self.sorted_and_terms.clear();
 
-                    match op {
-                        BoolOp::And => {
-                            self.bitset_tmp.load_postings(term_postings);
-                            self.bitset_res.intersect_with(&self.bitset_tmp);
+                    let first_tid = match corpus.vocab.get_term_id(first_term) {
+                        Some(id) => id,
+                        None => {
+                            output.push_str("0 0\n");
+                            return;
                         }
-                        BoolOp::Or => {
-                            self.bitset_res.union_postings(term_postings);
+                    };
+                    let first_len = corpus.get_posting_len(first_tid);
+                    if first_len == 0 {
+                        output.push_str("0 0\n");
+                        return;
+                    }
+                    self.sorted_and_terms.push((first_len, first_tid));
+
+                    for (_, term) in clauses {
+                        let tid = match corpus.vocab.get_term_id(term) {
+                            Some(id) => id,
+                            None => {
+                                output.push_str("0 0\n");
+                                return;
+                            }
+                        };
+                        let len = corpus.get_posting_len(tid);
+                        if len == 0 {
+                            output.push_str("0 0\n");
+                            return;
                         }
-                        BoolOp::Not => {
-                            self.bitset_tmp.load_postings(term_postings);
-                            self.bitset_res.difference_with(&self.bitset_tmp);
+                        self.sorted_and_terms.push((len, tid));
+                    }
+
+                    // Sort terms: smallest posting list first!
+                    self.sorted_and_terms.sort_unstable_by_key(|&(len, _)| len);
+
+                    // Load rarest term
+                    let (_, rarest_tid) = self.sorted_and_terms[0];
+                    match corpus.get_postings(rarest_tid) {
+                        Some(PostingRef::Sparse(initial)) => {
+                            self.candidate_docs.clear();
+                            self.candidate_docs.extend_from_slice(initial);
+
+                            for &(_, tid) in &self.sorted_and_terms[1..] {
+                                if self.candidate_docs.is_empty() {
+                                    break;
+                                }
+                                match corpus.get_postings(tid) {
+                                    Some(PostingRef::Sparse(other)) => {
+                                        // Galloping / binary search intersection
+                                        self.candidate_docs
+                                            .retain(|&id| other.binary_search(&id).is_ok());
+                                    }
+                                    Some(PostingRef::Dense(words)) => {
+                                        // Direct bit test
+                                        self.candidate_docs.retain(|&id| {
+                                            let idx = id as usize;
+                                            (words[idx / 64] & (1u64 << (idx % 64))) != 0
+                                        });
+                                    }
+                                    None => {
+                                        self.candidate_docs.clear();
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if self.candidate_docs.is_empty() {
+                                output.push_str("0 0\n");
+                            } else {
+                                let count = self.candidate_docs.len();
+                                let sum: u64 = self.candidate_docs.iter().map(|&id| id as u64).sum();
+                                let limit = count.min(10);
+                                format_result_into(count, sum, &self.candidate_docs[..limit], output);
+                            }
+                            return;
+                        }
+                        Some(PostingRef::Dense(words)) => {
+                            // Rarest term is already dense -> all terms are dense!
+                            self.bitset.load_dense(words);
+                            for &(_, tid) in &self.sorted_and_terms[1..] {
+                                match corpus.get_postings(tid) {
+                                    Some(PostingRef::Dense(w)) => self.bitset.intersect_with_dense(w),
+                                    Some(PostingRef::Sparse(s)) => self.bitset.intersect_with_sparse(s),
+                                    None => {
+                                        self.bitset.clear();
+                                        break;
+                                    }
+                                }
+                            }
+                            let (count, sum, first_10) = self.bitset.summary();
+                            format_result_into(count, sum, &first_10, output);
+                            return;
+                        }
+                        None => {
+                            output.push_str("0 0\n");
+                            return;
                         }
                     }
                 }
 
-                let (count, sum, first_10) = self.bitset_res.summary();
+                // General mixed boolean query: Strictly evaluate left to right
+                let first_id = corpus.vocab.get_term_id(first_term);
+                let first_postings = first_id.and_then(|id| corpus.get_postings(id));
+
+                match first_postings {
+                    Some(PostingRef::Sparse(s)) => self.bitset.load_sparse(s),
+                    Some(PostingRef::Dense(d)) => self.bitset.load_dense(d),
+                    None => self.bitset.clear(),
+                }
+
+                for (op, term) in clauses {
+                    let term_id = corpus.vocab.get_term_id(term);
+                    let term_postings = term_id.and_then(|id| corpus.get_postings(id));
+
+                    match (op, term_postings) {
+                        (BoolOp::And, Some(PostingRef::Sparse(s))) => self.bitset.intersect_with_sparse(s),
+                        (BoolOp::And, Some(PostingRef::Dense(d))) => self.bitset.intersect_with_dense(d),
+                        (BoolOp::And, None) => self.bitset.clear(),
+
+                        (BoolOp::Or, Some(PostingRef::Sparse(s))) => self.bitset.union_sparse(s),
+                        (BoolOp::Or, Some(PostingRef::Dense(d))) => self.bitset.union_dense(d),
+                        (BoolOp::Or, None) => {}
+
+                        (BoolOp::Not, Some(PostingRef::Sparse(s))) => self.bitset.difference_with_sparse(s),
+                        (BoolOp::Not, Some(PostingRef::Dense(d))) => self.bitset.difference_with_dense(d),
+                        (BoolOp::Not, None) => {}
+                    }
+                }
+
+                let (count, sum, first_10) = self.bitset.summary();
                 format_result_into(count, sum, &first_10, output);
             }
             ParsedQuery::Phrase { terms } => {
@@ -678,16 +939,21 @@ impl QueryEvaluator {
                     return;
                 }
 
-                let mut rarest_token_id = None;
+                let mut rarest_tid = None;
                 let mut min_len = usize::MAX;
 
                 for t in terms {
-                    if let Some(id) = corpus.vocab.get_id(t) {
-                        if let Some(postings) = corpus.postings.get(&id) {
-                            self.phrase_token_ids.push(id);
-                            if postings.len() < min_len {
-                                min_len = postings.len();
-                                rarest_token_id = Some(id);
+                    if let Some(pid) = corpus.vocab.get_phrase_id(t) {
+                        self.phrase_token_ids.push(pid);
+                        if let Some(tid) = corpus.vocab.get_term_id(t) {
+                            let len = corpus.get_posting_len(tid);
+                            if len == 0 {
+                                output.push_str("0 0\n");
+                                return;
+                            }
+                            if len < min_len {
+                                min_len = len;
+                                rarest_tid = Some(tid);
                             }
                         } else {
                             output.push_str("0 0\n");
@@ -699,7 +965,7 @@ impl QueryEvaluator {
                     }
                 }
 
-                let rarest_id = match rarest_token_id {
+                let r_id = match rarest_tid {
                     Some(id) => id,
                     None => {
                         output.push_str("0 0\n");
@@ -707,7 +973,7 @@ impl QueryEvaluator {
                     }
                 };
 
-                let initial_candidates = match corpus.postings.get(&rarest_id) {
+                let initial = match corpus.get_sparse_postings(r_id) {
                     Some(p) => p,
                     None => {
                         output.push_str("0 0\n");
@@ -715,34 +981,47 @@ impl QueryEvaluator {
                     }
                 };
 
-                self.candidate_docs.extend_from_slice(initial_candidates);
+                self.candidate_docs.extend_from_slice(initial);
 
-                for &id in &self.phrase_token_ids {
-                    if id == rarest_id {
-                        continue;
-                    }
-                    if let Some(postings) = corpus.postings.get(&id) {
-                        self.candidate_docs
-                            .retain(|doc_id| postings.binary_search(doc_id).is_ok());
-                    } else {
-                        output.push_str("0 0\n");
-                        return;
+                for t in terms {
+                    if let Some(tid) = corpus.vocab.get_term_id(t) {
+                        if tid == r_id {
+                            continue;
+                        }
+                        if let Some(postings) = corpus.get_sparse_postings(tid) {
+                            self.candidate_docs
+                                .retain(|doc_id| postings.binary_search(doc_id).is_ok());
+                        } else {
+                            output.push_str("0 0\n");
+                            return;
+                        }
                     }
                 }
 
                 let k = self.phrase_token_ids.len();
+                let first_tok = self.phrase_token_ids[0];
+                let target = &self.phrase_token_ids[..];
+
                 for &doc_id in &self.candidate_docs {
                     let id = doc_id as usize;
                     let start = corpus.doc_offsets[id] as usize;
                     let end = corpus.doc_offsets[id + 1] as usize;
                     let doc_slice = &corpus.doc_tokens[start..end];
 
-                    if doc_slice.len() >= k
-                        && doc_slice
-                            .windows(k)
-                            .any(|w| w == &self.phrase_token_ids[..])
-                    {
-                        self.matching_docs.push(doc_id);
+                    if doc_slice.len() >= k {
+                        let mut pos = 0;
+                        let max_pos = doc_slice.len() - k;
+                        let mut found = false;
+                        while pos <= max_pos {
+                            if doc_slice[pos] == first_tok && &doc_slice[pos..pos + k] == target {
+                                found = true;
+                                break;
+                            }
+                            pos += 1;
+                        }
+                        if found {
+                            self.matching_docs.push(doc_id);
+                        }
                     }
                 }
 
@@ -760,40 +1039,7 @@ impl QueryEvaluator {
             }
         }
     }
-
-    pub fn evaluate_query(&mut self, line: &[u8], corpus: &CorpusIndex, output: &mut String) {
-        let query = parse_query_line(line);
-        self.evaluate_parsed_query(&query, corpus, output);
-    }
 }
-
-pub fn sequential_evaluate_queries(
-    corpus: &CorpusIndex,
-    queries: &[ParsedQuery],
-) -> (Vec<String>, std::time::Duration, std::time::Duration) {
-    let mut evaluator = QueryEvaluator::new(corpus.num_docs);
-    let mut results = Vec::with_capacity(queries.len());
-    let mut buf = String::with_capacity(64);
-    let mut t_bool = std::time::Duration::ZERO;
-    let mut t_phrase = std::time::Duration::ZERO;
-
-    for query in queries {
-        buf.clear();
-        let t_start = std::time::Instant::now();
-        evaluator.evaluate_parsed_query(query, corpus, &mut buf);
-        let elapsed = t_start.elapsed();
-        match query {
-            ParsedQuery::Bool { .. } => t_bool += elapsed,
-            ParsedQuery::Phrase { .. } => t_phrase += elapsed,
-            ParsedQuery::Empty => {}
-        }
-        results.push(buf.clone());
-    }
-
-    (results, t_bool, t_phrase)
-}
-
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 pub fn parallel_evaluate_queries(
     corpus: &CorpusIndex,
@@ -862,25 +1108,6 @@ pub fn parallel_evaluate_queries(
     )
 }
 
-pub fn execute_index_pipeline(docs_data: &[u8], queries_data: &[u8]) -> Result<Vec<u8>, String> {
-    let query_vocab = extract_query_vocab(queries_data);
-    let corpus = CorpusIndex::build(docs_data, &query_vocab)?;
-    let parsed_queries = parse_all_queries(queries_data);
-
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    let (results, _, _) = parallel_evaluate_queries(&corpus, &parsed_queries, num_threads);
-
-    let mut output = String::with_capacity(queries_data.len() * 2);
-    for res in results {
-        output.push_str(&res);
-    }
-
-    Ok(output.into_bytes())
-}
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     let data_dir = if args.len() > 1 { &args[1] } else { "/data" };
@@ -917,33 +1144,15 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(num_threads);
 
-    let mode = env::var("QUERY_MODE").unwrap_or_else(|_| "parallel".to_string());
-    let ingest_mode = env::var("INGEST_MODE").unwrap_or_else(|_| "parallel".to_string());
-
     let t_ingest_start = std::time::Instant::now();
-    let query_vocab = extract_query_vocab(&queries_data);
-
-    let (corpus, t_workers, t_merge, worker_doc_counts) = if ingest_mode == "seq" || ingest_threads <= 1 {
-        let t_s = std::time::Instant::now();
-        let c = CorpusIndex::build_sequential(&docs_data, &query_vocab).expect("corpus index build failed");
-        let dt = t_s.elapsed();
-        let n_docs = c.num_docs;
-        (c, dt, std::time::Duration::ZERO, vec![n_docs])
-    } else {
-        CorpusIndex::build_parallel(&docs_data, &query_vocab, ingest_threads).expect("corpus index build failed")
-    };
+    let vocab = QueryVocabularies::extract(&queries_data);
+    let corpus = CorpusIndex::build(&docs_data, vocab, ingest_threads).expect("corpus index build failed");
     let parsed_queries = parse_all_queries(&queries_data);
     let t_ingest = t_ingest_start.elapsed();
 
-    let (results, t_query, t_bool_cpu, t_phrase_cpu) = if mode == "seq" {
-        let t_q_start = std::time::Instant::now();
-        let (r, tb, tp) = sequential_evaluate_queries(&corpus, &parsed_queries);
-        (r, t_q_start.elapsed(), tb, tp)
-    } else {
-        let t_q_start = std::time::Instant::now();
-        let (r, tb, tp) = parallel_evaluate_queries(&corpus, &parsed_queries, num_threads);
-        (r, t_q_start.elapsed(), tb, tp)
-    };
+    let t_q_start = std::time::Instant::now();
+    let (results, t_bool_cpu, t_phrase_cpu) = parallel_evaluate_queries(&corpus, &parsed_queries, num_threads);
+    let t_query = t_q_start.elapsed();
 
     let mut output_str = String::with_capacity(queries_data.len() * 2);
     for res in &results {
@@ -962,10 +1171,9 @@ fn main() {
     let t_total = t0.elapsed();
 
     eprintln!(
-        "Index pipeline [mode={}, threads={}, ingest_threads={}]: docs={}, queries={}, vocab_entries={}, stored_postings={}, ingest={:?} (workers={:?}, merge={:?}), query_wall={:?}, total={:?}",
-        mode, num_threads, worker_doc_counts.len(), corpus.num_docs, parsed_queries.len(), corpus.vocab.len(), corpus.retained_postings_count(), t_ingest, t_workers, t_merge, t_query, t_total
+        "Index pipeline [Prototype C, threads={}, ingest_threads={}]: docs={}, queries={}, vocab_entries={}, stored_postings={}, ingest={:?}, query_wall={:?}, total={:?}",
+        num_threads, ingest_threads, corpus.num_docs, parsed_queries.len(), corpus.vocab.num_terms(), corpus.retained_postings_count(), t_ingest, t_query, t_total
     );
-    eprintln!("Ingest workers doc counts: {:?}", worker_doc_counts);
     eprintln!(
         "Query work breakdown (aggregate CPU): bool={:?}, phrase={:?}",
         t_bool_cpu, t_phrase_cpu
@@ -973,7 +1181,7 @@ fn main() {
 
     if let Ok(status) = fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
-            if line.starts_with("VmHWM:") {
+            if line.starts_with("VmHWM:") || line.starts_with("RssAnon:") || line.starts_with("RssFile:") {
                 eprintln!("{}", line.trim());
             }
         }
@@ -1008,15 +1216,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tokenizer_case_007_distinct_from_7() {
-        let t1 = tokenize(b"Case 007");
-        let t2 = tokenize(b"Case 7");
-        assert_eq!(t1, vec![b"case".to_vec(), b"007".to_vec()]);
-        assert_eq!(t2, vec![b"case".to_vec(), b"7".to_vec()]);
-        assert_ne!(t1[1], t2[1]);
-    }
-
-    #[test]
     fn test_tokenizer_habeas_corpus_punctuation() {
         assert_eq!(
             tokenize(b"habeas-corpus, court's, U.S.C."),
@@ -1030,211 +1229,6 @@ mod tests {
                 b"c".to_vec(),
             ]
         );
-    }
-
-    #[test]
-    fn test_tokenizer_em_dash_and_utf8_bytes() {
-        let text = "bail—bond".as_bytes();
-        assert_eq!(tokenize(text), vec![b"bail".to_vec(), b"bond".to_vec()]);
-    }
-
-    #[test]
-    fn test_tokenizer_empty_and_separators_only() {
-        assert!(tokenize(b"").is_empty());
-        assert!(tokenize(b"   ").is_empty());
-        assert!(tokenize(b",.;:!@#$%^&*()_+-=").is_empty());
-        assert!(tokenize("§§ ¶ — ***".as_bytes()).is_empty());
-    }
-
-    #[test]
-    fn test_tokenizer_consecutive_and_trailing_separators() {
-        assert_eq!(
-            tokenize(b"...word1,,,,word2---"),
-            vec![b"word1".to_vec(), b"word2".to_vec()]
-        );
-    }
-
-    #[test]
-    fn test_token_position_preservation_with_non_queried_terms() {
-        let mut query_vocab = HashSet::new();
-        query_vocab.insert(b"bail".to_vec());
-        query_vocab.insert(b"bond".to_vec());
-
-        let docs_data = b"0\tbail bond\n1\tbail unqueried bond\n";
-        let corpus = CorpusIndex::build(docs_data, &query_vocab).unwrap();
-
-        assert_eq!(corpus.num_docs, 2);
-
-        let d0_start = corpus.doc_offsets[0] as usize;
-        let d0_end = corpus.doc_offsets[1] as usize;
-        let d0_tokens = &corpus.doc_tokens[d0_start..d0_end];
-        assert_eq!(d0_tokens.len(), 2);
-
-        let d1_start = corpus.doc_offsets[1] as usize;
-        let d1_end = corpus.doc_offsets[2] as usize;
-        let d1_tokens = &corpus.doc_tokens[d1_start..d1_end];
-        assert_eq!(d1_tokens.len(), 3);
-
-        let bail_id = corpus.vocab.get_id(b"bail").unwrap();
-        let bond_id = corpus.vocab.get_id(b"bond").unwrap();
-
-        assert_eq!(corpus.vocab.get_id(b"unqueried"), None);
-        assert_eq!(d0_tokens, &[bail_id, bond_id]);
-        assert_eq!(d1_tokens, &[bail_id, SENTINEL_TOKEN_ID, bond_id]);
-
-        let phrase = [bail_id, bond_id];
-        assert!(d0_tokens.windows(2).any(|w| w == phrase));
-        assert!(!d1_tokens.windows(2).any(|w| w == phrase));
-    }
-
-    #[test]
-    fn test_worked_example_end_to_end() {
-        let docs = b"0\tThe surety posted bail; the BAIL BOND was forfeited.\n\
-1\tWrit of Habeas-Corpus: see 42 U.S.C. \xC2\xA7 1983 (bail bond).\n\
-2\t\n\
-3\tZ\xC3\xBCrich bail\xE2\x80\x94bond, bail bail bond. Case 007.\n\
-4\tIn the matter of the estate. Bond not posted, No. 7.\n";
-
-        let queries = b"BOOL bail AND bond\n\
-BOOL bail\n\
-BOOL estate OR surety AND bail\n\
-BOOL bond NOT bail\n\
-BOOL bail NOT bail\n\
-BOOL zurich\n\
-BOOL rich AND z\n\
-BOOL not AND bond\n\
-BOOL 7\n\
-BOOL the OR writ OR case\n\
-PHRASE \"bail bond\"\n\
-PHRASE \"bail bail bond\"\n\
-PHRASE \"bond bail\"\n\
-PHRASE \"habeas corpus\"\n\
-PHRASE \"u s c 1983\"\n\
-PHRASE \"estate bond\"\n\
-PHRASE \"forfeited writ\"\n\
-PHRASE \"in the matter of\"\n";
-
-        let expected = b"3 4 0 1 3\n\
-3 4 0 1 3\n\
-1 0 0\n\
-1 4 4\n\
-0 0\n\
-0 0\n\
-1 3 3\n\
-1 4 4\n\
-1 4 4\n\
-4 8 0 1 3 4\n\
-3 4 0 1 3\n\
-1 3 3\n\
-1 3 3\n\
-1 1 1\n\
-1 1 1\n\
-1 4 4\n\
-0 0\n\
-1 4 4\n";
-
-        let out = execute_index_pipeline(docs, queries).unwrap();
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn test_boolean_operations_and_precedence() {
-        let docs = b"0\ta b\n1\ta c\n2\tb c\n3\td\n";
-        let queries = b"BOOL a AND b\nBOOL a OR b\nBOOL a NOT b\nBOOL b OR d AND a\n";
-        let expected = b"1 0 0\n3 3 0 1 2\n1 1 1\n1 0 0\n";
-        let out = execute_index_pipeline(docs, queries).unwrap();
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn test_phrases_repeated_words_and_boundary() {
-        let docs = b"0\tvery very good test\n1\tvery good\n2\t\n3\tgood very very\n";
-        let queries = b"PHRASE \"very very good\"\nPHRASE \"very good\"\nPHRASE \"missing word\"\n";
-        let expected = b"1 0 0\n2 1 0 1\n0 0\n";
-        let out = execute_index_pipeline(docs, queries).unwrap();
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn test_output_formatting_more_than_ten_matches() {
-        let mut docs = Vec::new();
-        for i in 0..15 {
-            docs.extend_from_slice(format!("{}\tx\n", i).as_bytes());
-        }
-        let queries = b"BOOL x\n";
-        let expected = b"15 105 0 1 2 3 4 5 6 7 8 9\n";
-        let out = execute_index_pipeline(&docs, queries).unwrap();
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn test_differential_sequential_versus_parallel() {
-        // Diverse corpus covering empty docs, repeated terms, punctuation, varied lengths, > 10 matches
-        let mut docs_vec = Vec::new();
-        for i in 0..30 {
-            if i % 5 == 0 {
-                docs_vec.extend_from_slice(format!("{}\t\n", i).as_bytes());
-            } else if i % 3 == 0 {
-                docs_vec.extend_from_slice(format!("{}\tapple banana apple cherry common\n", i).as_bytes());
-            } else {
-                docs_vec.extend_from_slice(format!("{}\tbanana cherry common dog elephant {}\n", i, i).as_bytes());
-            }
-        }
-
-        let queries_vec = b"BOOL common\n\
-BOOL common AND banana\n\
-BOOL common OR dog\n\
-BOOL common NOT apple\n\
-BOOL nonexisting\n\
-BOOL apple AND nonexisting\n\
-BOOL common OR nonexisting\n\
-PHRASE \"apple banana apple\"\n\
-PHRASE \"apple cherry common\"\n\
-PHRASE \"banana cherry common\"\n\
-PHRASE \"nonexisting phrase\"\n\
-PHRASE \"common nonexistent\"\n\
-BOOL 1 OR 2 OR 3\n\
-BOOL common AND dog NOT apple\n";
-
-        let query_vocab = extract_query_vocab(queries_vec);
-        let corpus = CorpusIndex::build(&docs_vec, &query_vocab).unwrap();
-        let parsed_queries = parse_all_queries(queries_vec);
-
-        let (seq_results, _, _) = sequential_evaluate_queries(&corpus, &parsed_queries);
-
-        for threads in [1, 2, 4, 8] {
-            let (par_results, _, _) = parallel_evaluate_queries(&corpus, &parsed_queries, threads);
-            assert_eq!(
-                seq_results, par_results,
-                "Sequential vs parallel results differed with {} threads!",
-                threads
-            );
-        }
-    }
-
-    #[test]
-    fn test_parallel_preserves_query_order() {
-        let docs = b"0\talpha beta gamma\n1\tbeta gamma delta\n2\talpha delta\n";
-        let mut queries = Vec::new();
-        for i in 0..100 {
-            if i % 3 == 0 {
-                queries.extend_from_slice(b"BOOL alpha AND beta\n");
-            } else if i % 3 == 1 {
-                queries.extend_from_slice(b"PHRASE \"beta gamma\"\n");
-            } else {
-                queries.extend_from_slice(b"BOOL delta NOT alpha\n");
-            }
-        }
-
-        let query_vocab = extract_query_vocab(&queries);
-        let corpus = CorpusIndex::build(docs, &query_vocab).unwrap();
-        let parsed_queries = parse_all_queries(&queries);
-
-        let (seq_results, _, _) = sequential_evaluate_queries(&corpus, &parsed_queries);
-        let (par_results, _, _) = parallel_evaluate_queries(&corpus, &parsed_queries, 6);
-
-        assert_eq!(seq_results.len(), 100);
-        assert_eq!(seq_results, par_results);
     }
 
     #[test]
@@ -1252,117 +1246,17 @@ BOOL even OR odd\n\
 PHRASE \"missing term here\"\n\
 PHRASE \"universal universal\"\n";
 
-        let query_vocab = extract_query_vocab(queries);
-        let corpus = CorpusIndex::build(&docs, &query_vocab).unwrap();
+        let vocab = QueryVocabularies::extract(queries);
+        let corpus = CorpusIndex::build(&docs, vocab, 4).unwrap();
         let parsed_queries = parse_all_queries(queries);
 
-        let (seq_results, _, _) = sequential_evaluate_queries(&corpus, &parsed_queries);
-        let (par_results, _, _) = parallel_evaluate_queries(&corpus, &parsed_queries, 4);
+        let (results, _, _) = parallel_evaluate_queries(&corpus, &parsed_queries, 4);
 
-        assert_eq!(seq_results, par_results);
-
-        // universal matches all 20 docs: count=20, sum=0+1+..+19 = 190, first 10: 0..9
-        assert_eq!(seq_results[0], "20 190 0 1 2 3 4 5 6 7 8 9\n");
-        // missing matches 0
-        assert_eq!(seq_results[1], "0 0\n");
-        // universal NOT universal matches 0
-        assert_eq!(seq_results[2], "0 0\n");
-        // even OR odd matches all 20 docs
-        assert_eq!(seq_results[3], "20 190 0 1 2 3 4 5 6 7 8 9\n");
-        // missing term phrase matches 0
-        assert_eq!(seq_results[4], "0 0\n");
-        // repeated universal is never consecutive -> 0
-        assert_eq!(seq_results[5], "0 0\n");
-    }
-
-    #[test]
-    fn test_worker_panic_propagation() {
-        // Verify that join().unwrap() properly propagates panics and never fails silently
-        let res = std::panic::catch_unwind(|| {
-            std::thread::scope(|s| {
-                let handle = s.spawn(|| {
-                    panic!("intentional worker failure");
-                });
-                handle.join().unwrap();
-            });
-        });
-        assert!(res.is_err(), "Worker panic must propagate to caller!");
-    }
-
-    #[test]
-    fn test_differential_sequential_versus_parallel_ingestion() {
-        let mut docs_vec = Vec::new();
-        for i in 0..60 {
-            if i % 7 == 0 {
-                // Empty document
-                docs_vec.extend_from_slice(format!("{}\t\n", i).as_bytes());
-            } else if i % 5 == 0 {
-                docs_vec.extend_from_slice(
-                    format!("{}\tapple banana cherry apple {}\n", i, i).as_bytes(),
-                );
-            } else if i % 3 == 0 {
-                docs_vec.extend_from_slice(
-                    format!("{}\tCase 007 Zurich-bail bond, unqueried word!\n", i).as_bytes(),
-                );
-            } else {
-                docs_vec.extend_from_slice(
-                    format!("{}\tword{} another{} bail bond {}\n", i, i, i, i).as_bytes(),
-                );
-            }
-        }
-
-        let queries_vec = b"BOOL bail AND bond\n\
-BOOL apple OR cherry\n\
-BOOL zurich NOT case\n\
-BOOL 007\n\
-PHRASE \"bail bond\"\n\
-PHRASE \"apple banana cherry\"\n\
-PHRASE \"zurich bail bond\"\n";
-
-        let query_vocab = extract_query_vocab(queries_vec);
-        let seq_corpus = CorpusIndex::build_sequential(&docs_vec, &query_vocab).unwrap();
-
-        for threads in [1, 2, 3, 5, 8, 12, 16] {
-            let (par_corpus, _, _, _) =
-                CorpusIndex::build_parallel(&docs_vec, &query_vocab, threads).unwrap();
-
-            assert_eq!(seq_corpus.num_docs, par_corpus.num_docs, "threads={}", threads);
-            assert_eq!(seq_corpus.total_tokens, par_corpus.total_tokens, "threads={}", threads);
-            assert_eq!(seq_corpus.doc_offsets, par_corpus.doc_offsets, "threads={}", threads);
-            assert_eq!(seq_corpus.doc_tokens, par_corpus.doc_tokens, "threads={}", threads);
-            assert_eq!(seq_corpus.postings, par_corpus.postings, "threads={}", threads);
-        }
-    }
-
-    #[test]
-    fn test_parallel_ingestion_uneven_and_empty_chunks() {
-        // 1 document with 8 threads (more threads than docs)
-        let docs1 = b"0\tsingle doc test\n";
-        let queries1 = b"BOOL single\n";
-        let qv1 = extract_query_vocab(queries1);
-        let seq1 = CorpusIndex::build_sequential(docs1, &qv1).unwrap();
-        let (par1, _, _, _) = CorpusIndex::build_parallel(docs1, &qv1, 8).unwrap();
-        assert_eq!(seq1.doc_tokens, par1.doc_tokens);
-        assert_eq!(seq1.postings, par1.postings);
-
-        // All empty documents
-        let docs2 = b"0\t\n1\t\n2\t\n3\t\n";
-        let queries2 = b"BOOL anything\n";
-        let qv2 = extract_query_vocab(queries2);
-        let seq2 = CorpusIndex::build_sequential(docs2, &qv2).unwrap();
-        let (par2, _, _, _) = CorpusIndex::build_parallel(docs2, &qv2, 4).unwrap();
-        assert_eq!(seq2.num_docs, par2.num_docs);
-        assert_eq!(seq2.doc_tokens, par2.doc_tokens);
-        assert_eq!(seq2.postings, par2.postings);
-
-        // Uneven document lengths and trailing newlines
-        let docs3 = b"0\tshort\n1\tlong text with many words that crosses boundaries\n2\t\n3\tend\n\n";
-        let queries3 = b"BOOL short\nBOOL words\n";
-        let qv3 = extract_query_vocab(queries3);
-        let seq3 = CorpusIndex::build_sequential(docs3, &qv3).unwrap();
-        let (par3, _, _, _) = CorpusIndex::build_parallel(docs3, &qv3, 5).unwrap();
-        assert_eq!(seq3.num_docs, par3.num_docs);
-        assert_eq!(seq3.doc_tokens, par3.doc_tokens);
-        assert_eq!(seq3.postings, par3.postings);
+        assert_eq!(results[0], "20 190 0 1 2 3 4 5 6 7 8 9\n");
+        assert_eq!(results[1], "0 0\n");
+        assert_eq!(results[2], "0 0\n");
+        assert_eq!(results[3], "20 190 0 1 2 3 4 5 6 7 8 9\n");
+        assert_eq!(results[4], "0 0\n");
+        assert_eq!(results[5], "0 0\n");
     }
 }
