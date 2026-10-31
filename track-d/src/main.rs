@@ -5,16 +5,167 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
+
+#[cfg(unix)]
+mod sys_mmap {
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
+    use std::ptr;
+
+    pub struct MmapFile {
+        ptr: *const u8,
+        len: usize,
+    }
+
+    impl MmapFile {
+        pub fn open(file: &File, len: usize) -> Result<Self, String> {
+            if len == 0 {
+                return Ok(Self {
+                    ptr: ptr::null(),
+                    len: 0,
+                });
+            }
+            unsafe {
+                let addr = libc_mmap(
+                    ptr::null_mut(),
+                    len,
+                    PROT_READ,
+                    MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                );
+                if addr == MAP_FAILED {
+                    return Err("mmap failed".to_string());
+                }
+                Ok(Self {
+                    ptr: addr as *const u8,
+                    len,
+                })
+            }
+        }
+
+        #[inline]
+        pub fn as_slice(&self) -> &[u8] {
+            if self.len == 0 || self.ptr.is_null() {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+            }
+        }
+    }
+
+    impl Drop for MmapFile {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() && self.len > 0 {
+                unsafe {
+                    libc_munmap(self.ptr as *mut _, self.len);
+                }
+            }
+        }
+    }
+
+    unsafe impl Send for MmapFile {}
+    unsafe impl Sync for MmapFile {}
+
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 2;
+    const MAP_FAILED: *mut libc_c_void = !0 as *mut libc_c_void;
+
+    type libc_c_void = std::ffi::c_void;
+    type libc_size_t = usize;
+    type libc_off_t = i64;
+    type libc_c_int = i32;
+
+    extern "C" {
+        #[link_name = "mmap"]
+        fn libc_mmap(
+            addr: *mut libc_c_void,
+            len: libc_size_t,
+            prot: libc_c_int,
+            flags: libc_c_int,
+            fd: libc_c_int,
+            offset: libc_off_t,
+        ) -> *mut libc_c_void;
+
+        #[link_name = "munmap"]
+        fn libc_munmap(addr: *mut libc_c_void, len: libc_size_t) -> libc_c_int;
+    }
+}
+
+pub enum InputBuffer {
+    #[cfg(unix)]
+    Mmap(sys_mmap::MmapFile),
+    Vec(Vec<u8>),
+}
+
+impl InputBuffer {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let file = fs::File::open(path).map_err(|e| e.to_string())?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        let len = metadata.len() as usize;
+
+        #[cfg(unix)]
+        {
+            if let Ok(mmap) = sys_mmap::MmapFile::open(&file, len) {
+                return Ok(InputBuffer::Mmap(mmap));
+            }
+        }
+
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        Ok(InputBuffer::Vec(bytes))
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(unix)]
+            InputBuffer::Mmap(m) => m.as_slice(),
+            InputBuffer::Vec(v) => v.as_slice(),
+        }
+    }
+}
+
+pub fn partition_byte_ranges(data: &[u8], num_chunks: usize) -> Vec<&[u8]> {
+    if data.is_empty() || num_chunks <= 1 {
+        return vec![data];
+    }
+    let total_len = data.len();
+    let mut boundaries = Vec::with_capacity(num_chunks + 1);
+    boundaries.push(0);
+
+    for i in 1..num_chunks {
+        let tentative = (i * total_len) / num_chunks;
+        let mut b = tentative;
+        while b < total_len && data[b] != b'\n' {
+            b += 1;
+        }
+        if b < total_len {
+            b += 1; // Advance past newline so next chunk starts on a fresh line
+        }
+        let prev = *boundaries.last().unwrap();
+        if b < prev {
+            b = prev;
+        }
+        boundaries.push(b);
+    }
+    boundaries.push(total_len);
+
+    let mut chunks = Vec::with_capacity(num_chunks);
+    for w in boundaries.windows(2) {
+        chunks.push(&data[w[0]..w[1]]);
+    }
+    chunks
+}
 
 #[derive(Copy, Clone, Eq, PartialEq)]
-struct State {
-    cost: u64,
-    node: u32,
+pub struct State {
+    pub cost: u64,
+    pub node: u32,
 }
 
 impl Ord for State {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Min-heap: reverse order on cost
         other
             .cost
             .cmp(&self.cost)
@@ -28,30 +179,26 @@ impl PartialOrd for State {
     }
 }
 
+#[derive(Debug)]
 pub struct CsrGraph {
     pub num_nodes: u32,
     pub raw_edge_count: usize,
     pub retained_edge_count: usize,
-    // Forward CSR
     pub offsets: Vec<u32>,
     pub head: Vec<u32>,
     pub weight: Vec<u32>,
-    // Backward CSR
     pub rev_offsets: Vec<u32>,
     pub rev_head: Vec<u32>,
     pub rev_weight: Vec<u32>,
-    // Degrees
-    pub in_degrees: Vec<u32>,
-    pub out_degrees: Vec<u32>,
-    // Weakly Connected Components
     pub wcc: Vec<u32>,
 }
 
 impl CsrGraph {
     #[inline]
     pub fn out_deg(&self, u: u32) -> u32 {
-        if (u as usize) < self.out_degrees.len() {
-            self.out_degrees[u as usize]
+        let u_idx = u as usize;
+        if u_idx + 1 < self.offsets.len() {
+            self.offsets[u_idx + 1] - self.offsets[u_idx]
         } else {
             0
         }
@@ -59,8 +206,9 @@ impl CsrGraph {
 
     #[inline]
     pub fn in_deg(&self, v: u32) -> u32 {
-        if (v as usize) < self.in_degrees.len() {
-            self.in_degrees[v as usize]
+        let v_idx = v as usize;
+        if v_idx + 1 < self.rev_offsets.len() {
+            self.rev_offsets[v_idx + 1] - self.rev_offsets[v_idx]
         } else {
             0
         }
@@ -68,53 +216,54 @@ impl CsrGraph {
 
     #[inline]
     pub fn neighbors(&self, u: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
-        let u_idx = u as usize;
-        let start = self.offsets[u_idx] as usize;
-        let end = self.offsets[u_idx + 1] as usize;
-        self.head[start..end]
-            .iter()
-            .copied()
-            .zip(self.weight[start..end].iter().copied())
+        let start = self.offsets[u as usize] as usize;
+        let end = self.offsets[(u + 1) as usize] as usize;
+        (start..end).map(move |i| (self.head[i], self.weight[i]))
     }
 
     #[inline]
     pub fn rev_neighbors(&self, v: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
-        let v_idx = v as usize;
-        let start = self.rev_offsets[v_idx] as usize;
-        let end = self.rev_offsets[v_idx + 1] as usize;
-        self.rev_head[start..end]
-            .iter()
-            .copied()
-            .zip(self.rev_weight[start..end].iter().copied())
+        let start = self.rev_offsets[v as usize] as usize;
+        let end = self.rev_offsets[(v + 1) as usize] as usize;
+        (start..end).map(move |i| (self.rev_head[i], self.rev_weight[i]))
     }
 }
 
-struct FastParser<'a> {
+pub struct FastParser<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
 impl<'a> FastParser<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    #[inline]
+    pub fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
 
     #[inline]
     fn skip_whitespace(&mut self) {
-        while self.pos < self.data.len() && self.data[self.pos].is_ascii_whitespace() {
+        while self.pos < self.data.len()
+            && (self.data[self.pos] == b' '
+                || self.data[self.pos] == b'\t'
+                || self.data[self.pos] == b'\n'
+                || self.data[self.pos] == b'\r')
+        {
             self.pos += 1;
         }
     }
 
     #[inline]
-    fn parse_u32(&mut self) -> Result<u32, String> {
+    pub fn parse_u32(&mut self) -> Result<u32, String> {
         self.skip_whitespace();
         if self.pos >= self.data.len() {
-            return Err("unexpected EOF parsing u32".to_string());
+            return Err("unexpected EOF".to_string());
         }
         let start = self.pos;
-        let mut val: u32 = 0;
-        while self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
+        let mut val = 0u32;
+        while self.pos < self.data.len()
+            && self.data[self.pos] >= b'0'
+            && self.data[self.pos] <= b'9'
+        {
             let digit = (self.data[self.pos] - b'0') as u32;
             val = val
                 .checked_mul(10)
@@ -129,14 +278,17 @@ impl<'a> FastParser<'a> {
     }
 
     #[inline]
-    fn parse_u64(&mut self) -> Result<u64, String> {
+    pub fn parse_u64(&mut self) -> Result<u64, String> {
         self.skip_whitespace();
         if self.pos >= self.data.len() {
-            return Err("unexpected EOF parsing u64".to_string());
+            return Err("unexpected EOF".to_string());
         }
         let start = self.pos;
-        let mut val: u64 = 0;
-        while self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
+        let mut val = 0u64;
+        while self.pos < self.data.len()
+            && self.data[self.pos] >= b'0'
+            && self.data[self.pos] <= b'9'
+        {
             let digit = (self.data[self.pos] - b'0') as u64;
             val = val
                 .checked_mul(10)
@@ -151,26 +303,26 @@ impl<'a> FastParser<'a> {
     }
 
     #[inline]
-    fn has_more(&mut self) -> bool {
+    pub fn has_more(&mut self) -> bool {
         self.skip_whitespace();
         self.pos < self.data.len()
     }
 }
 
-struct Dsu {
+pub struct Dsu {
     parent: Vec<u32>,
     rank: Vec<u8>,
 }
 
 impl Dsu {
-    fn new(n: u32) -> Self {
+    pub fn new(n: u32) -> Self {
         Self {
             parent: (0..n).collect(),
             rank: vec![0; n as usize],
         }
     }
 
-    fn find(&mut self, mut x: u32) -> u32 {
+    pub fn find(&mut self, mut x: u32) -> u32 {
         let mut root = x;
         while root != self.parent[root as usize] {
             root = self.parent[root as usize];
@@ -183,7 +335,7 @@ impl Dsu {
         root
     }
 
-    fn union(&mut self, a: u32, b: u32) {
+    pub fn union(&mut self, a: u32, b: u32) {
         let root_a = self.find(a);
         let root_b = self.find(b);
         if root_a != root_b {
@@ -201,73 +353,183 @@ impl Dsu {
     }
 }
 
+pub struct BitSet {
+    words: Vec<u64>,
+}
+
+impl BitSet {
+    pub fn new(num_bits: usize) -> Self {
+        let num_words = (num_bits + 63) / 64;
+        Self {
+            words: vec![0u64; num_words],
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, idx: usize) -> bool {
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        (self.words[word_idx] & (1u64 << bit_idx)) != 0
+    }
+
+    #[inline]
+    pub fn set(&mut self, idx: usize, val: bool) {
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        if val {
+            self.words[word_idx] |= 1u64 << bit_idx;
+        } else {
+            self.words[word_idx] &= !(1u64 << bit_idx);
+        }
+    }
+}
+
+struct SyncSlice<T>(*mut T, usize);
+unsafe impl<T: Send> Send for SyncSlice<T> {}
+unsafe impl<T: Sync> Sync for SyncSlice<T> {}
+
+impl<T> SyncSlice<T> {
+    #[inline]
+    unsafe fn write(&self, index: usize, val: T) {
+        debug_assert!(index < self.1);
+        *self.0.add(index) = val;
+    }
+}
+
+/// Track D V3: Parallel Graph Parser with 2-Pass Direct CSR and deterministic deduplication
 pub fn parse_graph(data: &[u8]) -> Result<CsrGraph, String> {
-    let mut parser = FastParser::new(data);
-    let n = parser.parse_u32()?;
-    let m = parser.parse_u32()? as usize;
+    let mut header_parser = FastParser::new(data);
+    let n = header_parser.parse_u32()?;
+    let m = header_parser.parse_u32()? as usize;
+    header_parser.skip_whitespace();
+    let body_start = header_parser.pos;
+    let body = &data[body_start..];
 
-    let mut temp_edges: Vec<(u32, u32, u32)> = Vec::with_capacity(m);
-    let mut raw_out_degrees = vec![0u32; n as usize];
-    let mut dsu = Dsu::new(n);
+    let num_parse_threads = env::var("PARSE_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+                .min(4)
+        });
 
-    for _ in 0..m {
-        let u = parser.parse_u32()?;
-        let v = parser.parse_u32()?;
-        let w = parser.parse_u64()?;
+    let chunks = partition_byte_ranges(body, num_parse_threads);
 
-        if u >= n || v >= n {
-            return Err(format!("node id out of bounds: u={}, v={}, n={}", u, v, n));
+    // PASS 1: Parallel count of raw out-degrees per node (skipping self-loops)
+    let raw_out_degrees: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+
+    let pass1_res: Result<Vec<usize>, String> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let deg_ref = &raw_out_degrees;
+            handles.push(s.spawn(move || -> Result<usize, String> {
+                let mut parser = FastParser::new(chunk);
+                let mut edge_count = 0usize;
+                while parser.has_more() {
+                    let u = parser.parse_u32()?;
+                    let v = parser.parse_u32()?;
+                    let w = parser.parse_u64()?;
+
+                    if u >= n || v >= n {
+                        return Err(format!("node id out of bounds: u={}, v={}, n={}", u, v, n));
+                    }
+                    if w > u32::MAX as u64 {
+                        return Err(format!("weight exceeds u32::MAX: {}", w));
+                    }
+
+                    if u != v {
+                        deg_ref[u as usize].fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    edge_count += 1;
+                }
+                Ok(edge_count)
+            }));
         }
-        if w > u32::MAX as u64 {
-            return Err(format!("weight exceeds u32::MAX: {}", w));
-        }
-        let w_u32 = w as u32;
 
-        // Ignore self-loops
-        if u != v {
-            temp_edges.push((u, v, w_u32));
-            raw_out_degrees[u as usize] += 1;
-            dsu.union(u, v);
+        let mut counts = Vec::with_capacity(handles.len());
+        for h in handles {
+            counts.push(h.join().unwrap()?);
         }
+        Ok(counts)
+    });
+
+    let chunk_counts = pass1_res?;
+    let total_parsed_m: usize = chunk_counts.iter().sum();
+    if total_parsed_m != m {
+        return Err(format!("expected {} edges in header, found {}", m, total_parsed_m));
     }
 
-    // Bucket sort edges by u into CSR format
-    let mut bucket_offsets = vec![0usize; (n + 1) as usize];
+    // Prefix sum raw out-degrees into forward offsets
+    let mut raw_offsets = vec![0u32; (n + 1) as usize];
     for u in 0..n {
-        bucket_offsets[(u + 1) as usize] =
-            bucket_offsets[u as usize] + raw_out_degrees[u as usize] as usize;
+        let deg = raw_out_degrees[u as usize].load(AtomicOrdering::Relaxed);
+        raw_offsets[(u + 1) as usize] = raw_offsets[u as usize] + deg;
     }
+    let total_valid_edges = raw_offsets[n as usize] as usize;
 
-    let mut bucket_heads = vec![0u32; temp_edges.len()];
-    let mut bucket_weights = vec![0u32; temp_edges.len()];
-    let mut cursor = bucket_offsets.clone();
+    drop(raw_out_degrees);
 
-    for &(u, v, w) in &temp_edges {
-        let slot = cursor[u as usize];
-        bucket_heads[slot] = v;
-        bucket_weights[slot] = w;
-        cursor[u as usize] += 1;
-    }
+    // PASS 2: Parallel scatter of edges directly into head and weight
+    let mut head = vec![0u32; total_valid_edges];
+    let mut weight = vec![0u32; total_valid_edges];
 
-    // Step 2: For each node u, sort its out-edges by (v, w) and deduplicate parallel edges,
-    // retaining min weight for each unique (u, v) pair.
+    let cursor: Vec<AtomicU32> = (0..n)
+        .map(|u| AtomicU32::new(raw_offsets[u as usize]))
+        .collect();
+
+    let head_ptr = SyncSlice(head.as_mut_ptr(), total_valid_edges);
+    let weight_ptr = SyncSlice(weight.as_mut_ptr(), total_valid_edges);
+
+    let pass2_res: Result<(), String> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let cursor_ref = &cursor;
+            let hp = &head_ptr;
+            let wp = &weight_ptr;
+            handles.push(s.spawn(move || -> Result<(), String> {
+                let mut parser = FastParser::new(chunk);
+                while parser.has_more() {
+                    let u = parser.parse_u32()?;
+                    let v = parser.parse_u32()?;
+                    let w = parser.parse_u64()? as u32;
+
+                    if u != v {
+                        let slot = cursor_ref[u as usize].fetch_add(1, AtomicOrdering::Relaxed) as usize;
+                        unsafe {
+                            hp.write(slot, v);
+                            wp.write(slot, w);
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap()?;
+        }
+        Ok(())
+    });
+    pass2_res?;
+
+    drop(cursor);
+
+    // In-place deduplication: sort out-edges for each node u and retain min weight for parallel copies
     let mut final_offsets = vec![0u32; (n + 1) as usize];
-    let mut final_head = Vec::with_capacity(temp_edges.len());
-    let mut final_weight = Vec::with_capacity(temp_edges.len());
-    let mut in_degrees = vec![0u32; n as usize];
-    let mut final_out_degrees = vec![0u32; n as usize];
-
+    let mut write_idx = 0usize;
     let mut u_adj: Vec<(u32, u32)> = Vec::with_capacity(32);
 
     for u in 0..n {
-        final_offsets[u as usize] = final_head.len() as u32;
-        let start = bucket_offsets[u as usize];
-        let end = bucket_offsets[(u + 1) as usize];
+        final_offsets[u as usize] = write_idx as u32;
+        let start = raw_offsets[u as usize] as usize;
+        let end = raw_offsets[(u + 1) as usize] as usize;
 
         if start < end {
             u_adj.clear();
             for i in start..end {
-                u_adj.push((bucket_heads[i], bucket_weights[i]));
+                u_adj.push((head[i], weight[i]));
             }
             u_adj.sort_unstable_by_key(|&(v, w)| (v, w));
 
@@ -277,21 +539,26 @@ pub fn parse_graph(data: &[u8]) -> Result<CsrGraph, String> {
                     continue; // Skip parallel copy with heavier/equal weight
                 }
                 prev_v = Some(v);
-                final_head.push(v);
-                final_weight.push(w);
-                in_degrees[v as usize] += 1;
-                final_out_degrees[u as usize] += 1;
+                head[write_idx] = v;
+                weight[write_idx] = w;
+                write_idx += 1;
             }
         }
     }
-    final_offsets[n as usize] = final_head.len() as u32;
+    final_offsets[n as usize] = write_idx as u32;
+    head.truncate(write_idx);
+    weight.truncate(write_idx);
+    let retained_edge_count = write_idx;
 
-    let retained_edge_count = final_head.len();
+    drop(raw_offsets);
 
-    // Step 3: Build Backward CSR from the deduplicated forward edges
+    // Build Backward CSR from the deduplicated forward edges
     let mut rev_offsets = vec![0u32; (n + 1) as usize];
+    for &v in &head {
+        rev_offsets[(v + 1) as usize] += 1;
+    }
     for v in 0..n {
-        rev_offsets[(v + 1) as usize] = rev_offsets[v as usize] + in_degrees[v as usize];
+        rev_offsets[(v + 1) as usize] += rev_offsets[v as usize];
     }
 
     let mut rev_head = vec![0u32; retained_edge_count];
@@ -302,8 +569,8 @@ pub fn parse_graph(data: &[u8]) -> Result<CsrGraph, String> {
         let start = final_offsets[u as usize] as usize;
         let end = final_offsets[(u + 1) as usize] as usize;
         for i in start..end {
-            let v = final_head[i];
-            let w = final_weight[i];
+            let v = head[i];
+            let w = weight[i];
             let slot = rev_cursor[v as usize] as usize;
             rev_head[slot] = u;
             rev_weight[slot] = w;
@@ -311,55 +578,46 @@ pub fn parse_graph(data: &[u8]) -> Result<CsrGraph, String> {
         }
     }
 
-    // Step 4: Extract WCC labels for all nodes
+    // Build WCC on deduplicated forward edges
+    let mut dsu = Dsu::new(n);
+    for u in 0..n {
+        let start = final_offsets[u as usize] as usize;
+        let end = final_offsets[(u + 1) as usize] as usize;
+        for i in start..end {
+            dsu.union(u, head[i]);
+        }
+    }
+
     let mut wcc = vec![0u32; n as usize];
     for u in 0..n {
         wcc[u as usize] = dsu.find(u);
     }
-
-    // Verification check: sum of out_degrees must match retained edge count
-    let total_out_deg: u64 = final_out_degrees.iter().map(|&d| d as u64).sum();
-    let total_in_deg: u64 = in_degrees.iter().map(|&d| d as u64).sum();
-    assert_eq!(
-        total_out_deg, retained_edge_count as u64,
-        "out_degree sum mismatch"
-    );
-    assert_eq!(
-        total_in_deg, retained_edge_count as u64,
-        "in_degree sum mismatch"
-    );
 
     Ok(CsrGraph {
         num_nodes: n,
         raw_edge_count: m,
         retained_edge_count,
         offsets: final_offsets,
-        head: final_head,
-        weight: final_weight,
+        head,
+        weight,
         rev_offsets,
         rev_head,
         rev_weight,
-        in_degrees,
-        out_degrees: final_out_degrees,
         wcc,
     })
 }
 
 pub struct DijkstraContext {
-    // Forward state
-    dist_f: Vec<u64>,
-    epoch_f: Vec<u32>,
-    settled_f: Vec<u32>,
-    // Backward state
-    dist_b: Vec<u64>,
-    epoch_b: Vec<u32>,
-    settled_b: Vec<u32>,
-    // Current query epoch
-    current_epoch: u32,
-    // Heaps
-    heap_f: BinaryHeap<State>,
-    heap_b: BinaryHeap<State>,
-    // Settled counters for benchmarking
+    pub dist_f: Box<[u64]>,
+    pub dist_b: Box<[u64]>,
+    pub settled_f: BitSet,
+    pub settled_b: BitSet,
+    pub visited_f: Vec<u32>,
+    pub visited_b: Vec<u32>,
+    pub settled_nodes_f: Vec<u32>,
+    pub settled_nodes_b: Vec<u32>,
+    pub heap_f: BinaryHeap<State>,
+    pub heap_b: BinaryHeap<State>,
     pub total_settled_nodes: usize,
 }
 
@@ -367,13 +625,14 @@ impl DijkstraContext {
     pub fn new(num_nodes: u32) -> Self {
         let n = num_nodes as usize;
         Self {
-            dist_f: vec![u64::MAX; n],
-            epoch_f: vec![0u32; n],
-            settled_f: vec![0u32; n],
-            dist_b: vec![u64::MAX; n],
-            epoch_b: vec![0u32; n],
-            settled_b: vec![0u32; n],
-            current_epoch: 0,
+            dist_f: vec![u64::MAX; n].into_boxed_slice(),
+            dist_b: vec![u64::MAX; n].into_boxed_slice(),
+            settled_f: BitSet::new(n),
+            settled_b: BitSet::new(n),
+            visited_f: Vec::with_capacity(1024),
+            visited_b: Vec::with_capacity(1024),
+            settled_nodes_f: Vec::with_capacity(512),
+            settled_nodes_b: Vec::with_capacity(512),
             heap_f: BinaryHeap::with_capacity(1024),
             heap_b: BinaryHeap::with_capacity(1024),
             total_settled_nodes: 0,
@@ -381,18 +640,28 @@ impl DijkstraContext {
     }
 
     #[inline]
-    fn advance_epoch(&mut self) {
-        self.current_epoch = self.current_epoch.wrapping_add(1);
-        if self.current_epoch == 0 {
-            self.epoch_f.fill(0);
-            self.settled_f.fill(0);
-            self.epoch_b.fill(0);
-            self.settled_b.fill(0);
-            self.current_epoch = 1;
+    pub fn reset(&mut self) {
+        for &node in &self.visited_f {
+            self.dist_f[node as usize] = u64::MAX;
         }
+        self.visited_f.clear();
+
+        for &node in &self.visited_b {
+            self.dist_b[node as usize] = u64::MAX;
+        }
+        self.visited_b.clear();
+
+        for &node in &self.settled_nodes_f {
+            self.settled_f.set(node as usize, false);
+        }
+        self.settled_nodes_f.clear();
+
+        for &node in &self.settled_nodes_b {
+            self.settled_b.set(node as usize, false);
+        }
+        self.settled_nodes_b.clear();
     }
 
-    /// Preserved Sequential Dijkstra baseline for reference & differential testing
     pub fn sequential_shortest_path(&mut self, graph: &CsrGraph, s: u32, t: u32) -> i64 {
         if s == t {
             return 0;
@@ -404,14 +673,15 @@ impl DijkstraContext {
             return -1;
         }
 
-        self.advance_epoch();
+        self.reset();
         self.heap_f.clear();
 
         let s_idx = s as usize;
-        self.epoch_f[s_idx] = self.current_epoch;
+        self.visited_f.push(s);
         self.dist_f[s_idx] = 0;
         self.heap_f.push(State { cost: 0, node: s });
 
+        let mut result = -1i64;
         while let Some(State { cost, node }) = self.heap_f.pop() {
             let node_idx = node as usize;
             if cost > self.dist_f[node_idx] {
@@ -420,16 +690,22 @@ impl DijkstraContext {
             self.total_settled_nodes += 1;
 
             if node == t {
-                return cost as i64;
+                result = cost as i64;
+                break;
             }
 
             for (v, w) in graph.neighbors(node) {
                 let v_idx = v as usize;
                 let next_cost = cost.saturating_add(w as u64);
 
-                let is_unvisited = self.epoch_f[v_idx] != self.current_epoch;
-                if is_unvisited || next_cost < self.dist_f[v_idx] {
-                    self.epoch_f[v_idx] = self.current_epoch;
+                if self.dist_f[v_idx] == u64::MAX {
+                    self.visited_f.push(v);
+                    self.dist_f[v_idx] = next_cost;
+                    self.heap_f.push(State {
+                        cost: next_cost,
+                        node: v,
+                    });
+                } else if next_cost < self.dist_f[v_idx] {
                     self.dist_f[v_idx] = next_cost;
                     self.heap_f.push(State {
                         cost: next_cost,
@@ -439,34 +715,32 @@ impl DijkstraContext {
             }
         }
 
-        -1
+        self.reset();
+        result
     }
 
-    /// Bidirectional Dijkstra with mathematically proven stopping condition
     pub fn bidirectional_shortest_path(&mut self, graph: &CsrGraph, s: u32, t: u32) -> i64 {
         if s == t {
             return 0;
         }
-        // WCC filter: if in different undirected components, strictly unreachable
         if graph.wcc[s as usize] != graph.wcc[t as usize] {
             return -1;
         }
-        // Degree filters
         if graph.out_deg(s) == 0 || graph.in_deg(t) == 0 {
             return -1;
         }
 
-        self.advance_epoch();
+        self.reset();
         self.heap_f.clear();
         self.heap_b.clear();
 
         let s_idx = s as usize;
-        self.epoch_f[s_idx] = self.current_epoch;
+        self.visited_f.push(s);
         self.dist_f[s_idx] = 0;
         self.heap_f.push(State { cost: 0, node: s });
 
         let t_idx = t as usize;
-        self.epoch_b[t_idx] = self.current_epoch;
+        self.visited_b.push(t);
         self.dist_b[t_idx] = 0;
         self.heap_b.push(State { cost: 0, node: t });
 
@@ -480,14 +754,12 @@ impl DijkstraContext {
                 break;
             }
 
-            // Stopping condition: sum of frontier minima >= best complete path mu
             if let (Some(df), Some(db)) = (top_f, top_b) {
                 if df.saturating_add(db) >= mu {
                     break;
                 }
             }
 
-            // Alternate frontiers: expand the direction with smaller top key
             let expand_forward = match (top_f, top_b) {
                 (Some(df), Some(db)) => df <= db,
                 (Some(_), None) => true,
@@ -499,35 +771,42 @@ impl DijkstraContext {
                 let State { cost, node } = self.heap_f.pop().unwrap();
                 let node_idx = node as usize;
                 if cost > self.dist_f[node_idx] {
-                    continue; // Stale heap entry
-                }
-                if self.settled_f[node_idx] == self.current_epoch {
                     continue;
                 }
-                self.settled_f[node_idx] = self.current_epoch;
+                if self.settled_f.get(node_idx) {
+                    continue;
+                }
+                self.settled_f.set(node_idx, true);
+                self.settled_nodes_f.push(node);
                 self.total_settled_nodes += 1;
 
-                // Check meeting at common vertex
-                if self.epoch_b[node_idx] == self.current_epoch {
+                if self.dist_b[node_idx] != u64::MAX {
                     mu = mu.min(cost.saturating_add(self.dist_b[node_idx]));
                 }
 
-                // Relax forward out-edges
                 for (v, w) in graph.neighbors(node) {
                     let v_idx = v as usize;
                     let next_cost = cost.saturating_add(w as u64);
 
-                    let is_unvisited = self.epoch_f[v_idx] != self.current_epoch;
-                    if is_unvisited || next_cost < self.dist_f[v_idx] {
-                        self.epoch_f[v_idx] = self.current_epoch;
+                    if self.dist_f[v_idx] == u64::MAX {
+                        self.visited_f.push(v);
                         self.dist_f[v_idx] = next_cost;
                         self.heap_f.push(State {
                             cost: next_cost,
                             node: v,
                         });
 
-                        // Check crossing edge into backward frontier
-                        if self.epoch_b[v_idx] == self.current_epoch {
+                        if self.dist_b[v_idx] != u64::MAX {
+                            mu = mu.min(next_cost.saturating_add(self.dist_b[v_idx]));
+                        }
+                    } else if next_cost < self.dist_f[v_idx] {
+                        self.dist_f[v_idx] = next_cost;
+                        self.heap_f.push(State {
+                            cost: next_cost,
+                            node: v,
+                        });
+
+                        if self.dist_b[v_idx] != u64::MAX {
                             mu = mu.min(next_cost.saturating_add(self.dist_b[v_idx]));
                         }
                     }
@@ -536,35 +815,42 @@ impl DijkstraContext {
                 let State { cost, node } = self.heap_b.pop().unwrap();
                 let node_idx = node as usize;
                 if cost > self.dist_b[node_idx] {
-                    continue; // Stale heap entry
-                }
-                if self.settled_b[node_idx] == self.current_epoch {
                     continue;
                 }
-                self.settled_b[node_idx] = self.current_epoch;
+                if self.settled_b.get(node_idx) {
+                    continue;
+                }
+                self.settled_b.set(node_idx, true);
+                self.settled_nodes_b.push(node);
                 self.total_settled_nodes += 1;
 
-                // Check meeting at common vertex
-                if self.epoch_f[node_idx] == self.current_epoch {
+                if self.dist_f[node_idx] != u64::MAX {
                     mu = mu.min(self.dist_f[node_idx].saturating_add(cost));
                 }
 
-                // Relax backward in-edges (u -> node in original graph)
                 for (u, w) in graph.rev_neighbors(node) {
                     let u_idx = u as usize;
                     let next_cost = cost.saturating_add(w as u64);
 
-                    let is_unvisited = self.epoch_b[u_idx] != self.current_epoch;
-                    if is_unvisited || next_cost < self.dist_b[u_idx] {
-                        self.epoch_b[u_idx] = self.current_epoch;
+                    if self.dist_b[u_idx] == u64::MAX {
+                        self.visited_b.push(u);
                         self.dist_b[u_idx] = next_cost;
                         self.heap_b.push(State {
                             cost: next_cost,
                             node: u,
                         });
 
-                        // Check crossing edge into forward frontier
-                        if self.epoch_f[u_idx] == self.current_epoch {
+                        if self.dist_f[u_idx] != u64::MAX {
+                            mu = mu.min(self.dist_f[u_idx].saturating_add(next_cost));
+                        }
+                    } else if next_cost < self.dist_b[u_idx] {
+                        self.dist_b[u_idx] = next_cost;
+                        self.heap_b.push(State {
+                            cost: next_cost,
+                            node: u,
+                        });
+
+                        if self.dist_f[u_idx] != u64::MAX {
                             mu = mu.min(self.dist_f[u_idx].saturating_add(next_cost));
                         }
                     }
@@ -572,11 +858,9 @@ impl DijkstraContext {
             }
         }
 
-        if mu == u64::MAX {
-            -1
-        } else {
-            mu as i64
-        }
+        let ans = if mu == u64::MAX { -1 } else { mu as i64 };
+        self.reset();
+        ans
     }
 }
 
@@ -605,8 +889,6 @@ pub fn run_traverse(graph_data: &[u8], queries_data: &[u8]) -> Result<Vec<u8>, S
 
     Ok(output.into_bytes())
 }
-
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 pub fn parallel_bidirectional_traverse(
     graph: &CsrGraph,
@@ -674,26 +956,28 @@ fn main() {
         std::process::exit(1);
     }
 
-    let graph_data = fs::read(&graph_path).expect("failed to read graph.txt");
-    let queries_data = fs::read(&queries_path).expect("failed to read queries.txt");
+    let graph_buf = InputBuffer::open(&graph_path).expect("failed to open graph.txt");
+    let queries_buf = InputBuffer::open(&queries_path).expect("failed to open queries.txt");
 
-    let graph = parse_graph(&graph_data).expect("graph parse failed");
+    let t_graph_start = std::time::Instant::now();
+    let graph = parse_graph(graph_buf.as_slice()).expect("graph parse failed");
+    let t_graph_elapsed = t_graph_start.elapsed();
+
     eprintln!(
-        "Graph parsed: {} nodes, {} raw edges, {} retained edges (deduped)",
-        graph.num_nodes, graph.raw_edge_count, graph.retained_edge_count
+        "Graph parsed in {:?}: {} nodes, {} raw edges, {} retained edges (deduped)",
+        t_graph_elapsed, graph.num_nodes, graph.raw_edge_count, graph.retained_edge_count
     );
-    let queries = parse_queries(&queries_data).expect("queries parse failed");
+
+    let t_queries_start = std::time::Instant::now();
+    let queries = parse_queries(queries_buf.as_slice()).expect("queries parse failed");
+    let t_queries_elapsed = t_queries_start.elapsed();
+    eprintln!("Queries parsed in {:?}: {} queries", t_queries_elapsed, queries.len());
 
     let bench_mode = env::var("BENCH_MODE").unwrap_or_default();
     let num_threads = env::var("NUM_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(12)
-                .min(12)
-        });
+        .unwrap_or(4);
 
     let (answers, total_settled, mode_name, duration) = match bench_mode.as_str() {
         "seq" => {
@@ -716,48 +1000,7 @@ fn main() {
             let dur = start.elapsed();
             (ans, bidi_ctx.total_settled_nodes, "Single-threaded Bidirectional Dijkstra (1 thread)", dur)
         }
-        "compare" => {
-            // Run Sequential
-            let mut seq_ctx = DijkstraContext::new(graph.num_nodes);
-            let seq_start = std::time::Instant::now();
-            let mut seq_ans = Vec::with_capacity(queries.len());
-            for &(s, t) in &queries {
-                seq_ans.push(seq_ctx.sequential_shortest_path(&graph, s, t));
-            }
-            let seq_dur = seq_start.elapsed();
-
-            // Run Single-threaded Bidirectional
-            let mut bidi_ctx = DijkstraContext::new(graph.num_nodes);
-            let bidi_start = std::time::Instant::now();
-            let mut bidi_ans = Vec::with_capacity(queries.len());
-            for &(s, t) in &queries {
-                bidi_ans.push(bidi_ctx.bidirectional_shortest_path(&graph, s, t));
-            }
-            let bidi_dur = bidi_start.elapsed();
-
-            // Run Multithreaded Bidirectional
-            let mt_start = std::time::Instant::now();
-            let (mt_ans, mt_settled) = parallel_bidirectional_traverse(&graph, &queries, num_threads);
-            let mt_dur = mt_start.elapsed();
-
-            assert_eq!(seq_ans, bidi_ans, "sequential and bidi_1 differed");
-            assert_eq!(bidi_ans, mt_ans, "bidi_1 and bidi_mt differed");
-
-            eprintln!(
-                "SIDE-BY-SIDE BENCHMARK ON {} QUERIES:\n  [A] Sequential (1T):    {:?} ({} settled)\n  [B] Bidi (1T):          {:?} ({} settled)\n  [C] Bidi ({}T):         {:?} ({} settled)\n  Bidi/Seq Speedup: {:.2}x\n  MT/Seq Speedup:   {:.2}x\n  MT/Bidi Speedup:  {:.2}x",
-                queries.len(),
-                seq_dur, seq_ctx.total_settled_nodes,
-                bidi_dur, bidi_ctx.total_settled_nodes,
-                num_threads, mt_dur, mt_settled,
-                seq_dur.as_secs_f64() / bidi_dur.as_secs_f64(),
-                seq_dur.as_secs_f64() / mt_dur.as_secs_f64(),
-                bidi_dur.as_secs_f64() / mt_dur.as_secs_f64()
-            );
-
-            (mt_ans, mt_settled, "Multithreaded Bidirectional Dijkstra", mt_dur)
-        }
         _ => {
-            // Default production mode: Multithreaded Bidirectional Dijkstra
             let start = std::time::Instant::now();
             let (ans, settled) = parallel_bidirectional_traverse(&graph, &queries, num_threads);
             let dur = start.elapsed();
@@ -774,6 +1017,7 @@ fn main() {
         if bench_mode == "seq" || bench_mode == "bidi_1" { 1 } else { num_threads }
     );
 
+    let t_write_start = std::time::Instant::now();
     let mut output = String::with_capacity(answers.len() * 12);
     for dist in answers {
         writeln!(&mut output, "{}", dist).unwrap();
@@ -789,10 +1033,11 @@ fn main() {
     file.write_all(&output_bytes)
         .expect("failed to write distances.txt");
     file.flush().expect("failed to flush distances.txt");
+    eprintln!("Output written in {:?}", t_write_start.elapsed());
 
     if let Ok(status) = fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
-            if line.starts_with("VmHWM:") {
+            if line.starts_with("VmHWM:") || line.starts_with("RssAnon:") || line.starts_with("RssFile:") {
                 eprintln!("{}", line.trim());
             }
         }
@@ -929,10 +1174,6 @@ mod tests {
 
     #[test]
     fn test_asymmetric_directed_paths() {
-        // Directed triangle: 0 -> 1 (w=2), 1 -> 2 (w=3), 2 -> 0 (w=10)
-        // d(0, 2) = 2 + 3 = 5
-        // d(2, 0) = 10
-        // d(2, 1) = 10 + 2 = 12
         let graph_bytes = b"3 3\n0 1 2\n1 2 3\n2 0 10\n";
         let queries_bytes = b"0 2\n2 0\n2 1\n1 0\n";
         let out = run_traverse(graph_bytes, queries_bytes).unwrap();
@@ -941,18 +1182,12 @@ mod tests {
 
     #[test]
     fn test_multiple_crossing_edges_and_meeting_vertices() {
-        // Source 0, target 5.
-        // Path A: 0 -> 1 -> 2 -> 5 (weights 1, 10, 1 = 12)
-        // Path B: 0 -> 3 -> 4 -> 5 (weights 5, 1, 5 = 11)
-        // Path C: direct 0 -> 5 (weight 20)
-        // Crossing edge between paths: 1 -> 4 (weight 2) => 0 -> 1 -> 4 -> 5 (1 + 2 + 5 = 8)
         let graph_bytes = b"6 7\n0 1 1\n1 2 10\n2 5 1\n0 3 5\n3 4 1\n4 5 5\n1 4 2\n";
         let queries_bytes = b"0 5\n";
         let out = run_traverse(graph_bytes, queries_bytes).unwrap();
         assert_eq!(out, b"8\n");
     }
 
-    // Pseudo-random number generator for deterministic randomized differential testing
     struct SimpleRng {
         state: u64,
     }
@@ -971,7 +1206,6 @@ mod tests {
 
     #[test]
     fn test_randomized_differential_dijkstra() {
-        // Runs 50 randomized directed graphs comparing sequential vs bidirectional Dijkstra
         let mut rng = SimpleRng::new(0xDEADBEEFCAFE);
 
         for _ in 0..50 {
@@ -982,7 +1216,6 @@ mod tests {
             for _ in 0..m {
                 let u = rng.gen_range(0, n - 1);
                 let v = rng.gen_range(0, n - 1);
-                // Allow weights including 0 and up to 1000
                 let w = if rng.gen_range(0, 10) == 0 {
                     0
                 } else {
@@ -994,7 +1227,6 @@ mod tests {
             let graph = parse_graph(graph_str.as_bytes()).unwrap();
             let mut ctx = DijkstraContext::new(graph.num_nodes);
 
-            // Test every pair of nodes in this graph
             for s in 0..n {
                 for t in 0..n {
                     let seq_ans = ctx.sequential_shortest_path(&graph, s, t);
@@ -1006,7 +1238,6 @@ mod tests {
                         s, t, n, m, seq_ans, bidi_ans
                     );
 
-                    // Verify that WCC never rejects a reachable pair
                     if seq_ans != -1 {
                         assert_eq!(
                             graph.wcc[s as usize], graph.wcc[t as usize],
@@ -1017,5 +1248,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Additional V3 tests for parallel chunking, partition boundaries, empty chunks, and malformed inputs
+    #[test]
+    fn test_partition_byte_ranges_boundary_alignment() {
+        let sample_text = b"0 1 10\n1 2 20\n2 3 30\n3 4 40\n4 5 50\n5 6 60\n";
+        let chunks = partition_byte_ranges(sample_text, 3);
+        assert_eq!(chunks.len(), 3);
+        // Verify concatenation recovers exact byte sequence
+        let mut reconstructed = Vec::new();
+        for c in chunks {
+            assert!(c.is_empty() || c.ends_with(b"\n"), "Chunk must end with newline");
+            reconstructed.extend_from_slice(c);
+        }
+        assert_eq!(reconstructed, sample_text);
+    }
+
+    #[test]
+    fn test_partition_empty_chunks() {
+        let sample_text = b"0 1 10\n";
+        let chunks = partition_byte_ranges(sample_text, 4);
+        assert_eq!(chunks.len(), 4);
+        let non_empty: Vec<&[u8]> = chunks.into_iter().filter(|c| !c.is_empty()).collect();
+        assert_eq!(non_empty.len(), 1);
+        assert_eq!(non_empty[0], sample_text);
+    }
+
+    #[test]
+    fn test_duplicate_edges_split_across_chunks() {
+        // Parallel edges (0 -> 1) with weights 100, 20, 50 split across lines that will land in different chunks
+        let graph_bytes = b"4 6\n\
+0 1 100\n\
+1 2 5\n\
+2 3 10\n\
+0 1 20\n\
+3 0 15\n\
+0 1 50\n";
+        let queries_bytes = b"0 1\n";
+        let out = run_traverse(graph_bytes, queries_bytes).unwrap();
+        assert_eq!(out, b"20\n", "Parallel edges across chunks must retain minimum weight 20");
+    }
+
+    #[test]
+    fn test_self_loops_split_across_chunks() {
+        let graph_bytes = b"3 6\n\
+0 0 1\n\
+0 1 10\n\
+1 1 2\n\
+1 2 20\n\
+2 2 3\n\
+0 2 100\n";
+        let queries_bytes = b"0 2\n0 0\n";
+        let out = run_traverse(graph_bytes, queries_bytes).unwrap();
+        assert_eq!(out, b"30\n0\n", "Self-loops in any chunk must be safely ignored");
+    }
+
+    #[test]
+    fn test_malformed_input_in_parallel_chunk() {
+        // Line with out-of-bounds node id in middle chunk
+        let graph_bytes = b"4 4\n\
+0 1 10\n\
+1 2 20\n\
+99 3 30\n\
+2 3 40\n";
+        let res = parse_graph(graph_bytes);
+        assert!(res.is_err(), "Out-of-bounds node must return Err");
+        let err_msg = res.unwrap_err();
+        assert!(err_msg.contains("out of bounds"), "Error message should mention out of bounds: {}", err_msg);
     }
 }
