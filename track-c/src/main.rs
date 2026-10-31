@@ -58,17 +58,14 @@ impl RegionLookup {
         if pos < data.len() && data[pos] == b'\n' {
             pos += 1;
         }
-        let body_start = pos;
-
-        // Pass 1: find unique countries and max_region
+        // Single pass: collect (rid, code_idx) and unique countries
         let mut max_region = 0usize;
+        let mut entries = Vec::with_capacity(131072);
         while pos < data.len() {
             let mut rid = 0usize;
             while pos < data.len() && data[pos] != b',' {
                 let b = data[pos];
-                if b >= b'0' && b <= b'9' {
-                    rid = rid * 10 + (b - b'0') as usize;
-                }
+                rid = rid * 10 + (b.wrapping_sub(b'0')) as usize;
                 pos += 1;
             }
             if pos < data.len() && data[pos] == b',' {
@@ -82,9 +79,10 @@ impl RegionLookup {
                 let c0 = (data[pos] - b'A') as usize;
                 let c1 = (data[pos + 1] - b'A') as usize;
                 let c2 = (data[pos + 2] - b'A') as usize;
-                let code_idx = c0 * 676 + c1 * 26 + c2;
-                if code_idx < country_seen.len() && !country_seen[code_idx] {
-                    country_seen[code_idx] = true;
+                let code_idx = (c0 * 676 + c1 * 26 + c2) as u16;
+                entries.push((rid as u32, code_idx));
+                if !country_seen[code_idx as usize] {
+                    country_seen[code_idx as usize] = true;
                     country_names.push([data[pos], data[pos + 1], data[pos + 2]]);
                 }
             }
@@ -105,39 +103,10 @@ impl RegionLookup {
             code_to_country[c0 * 676 + c1 * 26 + c2] = i as u8;
         }
 
-        // Pass 2: populate region_to_country
         let mut region_to_country = vec![UNMATCHED_COUNTRY_IDX as u8; max_region + 1];
-        pos = body_start;
-        while pos < data.len() {
-            let mut rid = 0usize;
-            while pos < data.len() && data[pos] != b',' {
-                let b = data[pos];
-                if b >= b'0' && b <= b'9' {
-                    rid = rid * 10 + (b - b'0') as usize;
-                }
-                pos += 1;
-            }
-            if pos < data.len() && data[pos] == b',' {
-                pos += 1;
-            }
-
-            if pos + 3 <= data.len() && data[pos] >= b'A' && data[pos] <= b'Z' && data[pos + 1] >= b'A' && data[pos + 1] <= b'Z' && data[pos + 2] >= b'A' && data[pos + 2] <= b'Z' {
-                let c0 = (data[pos] - b'A') as usize;
-                let c1 = (data[pos + 1] - b'A') as usize;
-                let c2 = (data[pos + 2] - b'A') as usize;
-                let code_idx = c0 * 676 + c1 * 26 + c2;
-                if code_idx < code_to_country.len() {
-                    region_to_country[rid] = code_to_country[code_idx];
-                }
-            }
-            while pos < data.len() && data[pos] != b'\n' {
-                pos += 1;
-            }
-            if pos < data.len() && data[pos] == b'\n' {
-                pos += 1;
-            }
+        for (rid, code_idx) in entries {
+            region_to_country[rid as usize] = code_to_country[code_idx as usize];
         }
-
         Self {
             region_to_country,
             countries: country_names,
@@ -421,26 +390,26 @@ fn parse_records_chunk(
             0
         } else if pos < end && data[pos] == b'"' {
             pos += 1;
-            let mut unescaped_len = 0usize;
+            let start_note = pos;
+            let mut num_quotes = 0usize;
             while pos < end {
-                let b = data[pos];
-                if b == b'"' {
+                if data[pos] == b'"' {
                     if pos + 1 < end && data[pos + 1] == b'"' {
-                        unescaped_len += 1;
+                        num_quotes += 1;
                         pos += 2;
                     } else {
                         pos += 1;
                         break;
                     }
                 } else {
-                    unescaped_len += 1;
                     pos += 1;
                 }
             }
+            let raw_len = (pos - 1) - start_note;
             if pos < end && data[pos] == b',' {
                 pos += 1;
             }
-            unescaped_len as u64
+            (raw_len - num_quotes) as u64
         } else {
             let start_note = pos;
             while pos < end && data[pos] != b',' {

@@ -103,42 +103,71 @@ impl<'a> LocalEpSet<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CatSlot {
+    hash: u64,
+    prefix8: u64,
+    len: u16,
+    id: u16,
+}
+
 struct FastCatalog {
     keys: Vec<Vec<u8>>,
-    table_hashes: Vec<u64>,
-    table_ids: Vec<u16>,
+    slots: Vec<CatSlot>,
 }
 
 impl FastCatalog {
     fn new(sorted_endpoints: Vec<Vec<u8>>) -> Self {
-        let mut table_hashes = vec![0u64; HASH_TABLE_SIZE];
-        let mut table_ids = vec![0xffffu16; HASH_TABLE_SIZE];
+        let mut slots = vec![CatSlot { hash: 0, prefix8: 0, len: 0, id: 0xffff }; HASH_TABLE_SIZE];
 
         for (id, ep) in sorted_endpoints.iter().enumerate() {
             let h = fast_hash(ep);
+            let mut prefix8 = 0u64;
+            if ep.len() >= 8 {
+                prefix8 = u64::from_ne_bytes(ep[..8].try_into().unwrap());
+            } else if !ep.is_empty() {
+                let mut buf = [0u8; 8];
+                buf[..ep.len()].copy_from_slice(ep);
+                prefix8 = u64::from_ne_bytes(buf);
+            }
             let mut slot = (h as usize) & HASH_MASK;
-            while table_ids[slot] != 0xffff {
+            while slots[slot].id != 0xffff {
                 slot = (slot + 1) & HASH_MASK;
             }
-            table_hashes[slot] = h;
-            table_ids[slot] = id as u16;
+            slots[slot] = CatSlot {
+                hash: h,
+                prefix8,
+                len: ep.len() as u16,
+                id: id as u16,
+            };
         }
 
         Self {
             keys: sorted_endpoints,
-            table_hashes,
-            table_ids,
+            slots,
         }
     }
 
     #[inline(always)]
     fn get_id(&self, ep: &[u8]) -> usize {
         let h = fast_hash(ep);
+        let ep_len = ep.len() as u16;
+        let mut ep_p8 = 0u64;
+        if ep.len() >= 8 {
+            ep_p8 = u64::from_ne_bytes(ep[..8].try_into().unwrap());
+        } else if !ep.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..ep.len()].copy_from_slice(ep);
+            ep_p8 = u64::from_ne_bytes(buf);
+        }
+
         let mut slot = (h as usize) & HASH_MASK;
         loop {
-            let id = self.table_ids[slot];
-            if id != 0xffff && self.table_hashes[slot] == h && self.keys[id as usize] == ep {
-                return id as usize;
+            let s = self.slots[slot];
+            if s.id != 0xffff && s.hash == h && s.len == ep_len && s.prefix8 == ep_p8 {
+                if ep.len() <= 8 || self.keys[s.id as usize] == ep {
+                    return s.id as usize;
+                }
             }
             slot = (slot + 1) & HASH_MASK;
         }

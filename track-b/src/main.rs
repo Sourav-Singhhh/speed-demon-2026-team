@@ -18,9 +18,20 @@ impl std::hash::Hasher for FxHasher {
         self.hash
     }
     #[inline]
-    fn write(&mut self, bytes: &[u8]) {
+    fn write(&mut self, mut bytes: &[u8]) {
+        const K: u64 = 0x517cc1b727220a95;
+        while bytes.len() >= 8 {
+            let word = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+            self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(K);
+            bytes = &bytes[8..];
+        }
+        if bytes.len() >= 4 {
+            let word = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64;
+            self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(K);
+            bytes = &bytes[4..];
+        }
         for &b in bytes {
-            self.hash = (self.hash.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+            self.hash = (self.hash.rotate_left(5) ^ (b as u64)).wrapping_mul(K);
         }
     }
 }
@@ -313,9 +324,10 @@ impl<'a> CorpusIndex<'a> {
                             .ok_or_else(|| "missing TAB in doc line".to_string())?;
 
                         let id_bytes = &line[..tab_pos];
-                        let id_str = std::str::from_utf8(id_bytes).map_err(|e| e.to_string())?;
-                        let doc_id: usize =
-                            id_str.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                        let mut doc_id = 0usize;
+                        for &b in id_bytes {
+                            doc_id = doc_id * 10 + (b.wrapping_sub(b'0')) as usize;
+                        }
 
                         if !has_first {
                             first_doc_id = doc_id;
@@ -451,14 +463,10 @@ impl<'a> CorpusIndex<'a> {
                         };
 
                         let id_bytes = &line[..tab_pos];
-                        let id_str = match std::str::from_utf8(id_bytes) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        };
-                        let doc_id: u32 = match id_str.parse() {
-                            Ok(id) => id,
-                            Err(_) => continue,
-                        };
+                        let mut doc_id = 0u32;
+                        for &b in id_bytes {
+                            doc_id = doc_id * 10 + (b.wrapping_sub(b'0')) as u32;
+                        }
 
                         let text = &line[tab_pos + 1..];
                         seen_in_doc.clear();
