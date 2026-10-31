@@ -6,9 +6,51 @@ use std::io::Write as IoWrite;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+// Fast zero-dependency hasher (FxHash algorithm)
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.hash = (self.hash.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+}
+
+pub type FastBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+pub type FastHashMap<K, V> = HashMap<K, V, FastBuildHasher>;
+pub type FastHashSet<K> = HashSet<K, FastBuildHasher>;
+
+// Precomputed lookup table for byte-level tokenization:
+// 0 for delimiters; lowercase ASCII byte for alphanumeric tokens.
+static TOKEN_LUT: [u8; 256] = {
+    let mut lut = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        if (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') {
+            lut[i] = b;
+        } else if b >= b'A' && b <= b'Z' {
+            lut[i] = b + (b'a' - b'A');
+        } else {
+            lut[i] = 0;
+        }
+        i += 1;
+    }
+    lut
+};
+
 #[inline]
 pub fn is_token_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
+    TOKEN_LUT[b as usize] != 0
 }
 
 pub fn for_each_token<F>(text: &[u8], scratch: &mut Vec<u8>, mut on_token: F)
@@ -17,7 +59,7 @@ where
 {
     let mut i = 0;
     while i < text.len() {
-        while i < text.len() && !is_token_byte(text[i]) {
+        while i < text.len() && TOKEN_LUT[text[i] as usize] == 0 {
             i += 1;
         }
         if i >= text.len() {
@@ -25,8 +67,12 @@ where
         }
         let start = i;
         let mut has_upper = false;
-        while i < text.len() && is_token_byte(text[i]) {
-            if text[i].is_ascii_uppercase() {
+        while i < text.len() {
+            let c = TOKEN_LUT[text[i] as usize];
+            if c == 0 {
+                break;
+            }
+            if c != text[i] {
                 has_upper = true;
             }
             i += 1;
@@ -34,7 +80,10 @@ where
         let raw = &text[start..i];
         if has_upper {
             scratch.clear();
-            scratch.extend(raw.iter().map(|b| b.to_ascii_lowercase()));
+            scratch.reserve(raw.len());
+            for &b in raw {
+                scratch.push(TOKEN_LUT[b as usize]);
+            }
             on_token(scratch);
         } else {
             on_token(raw);
@@ -54,15 +103,15 @@ pub fn tokenize(text: &[u8]) -> Vec<Vec<u8>> {
 pub const SENTINEL_TOKEN_ID: u16 = 0xFFFF;
 
 pub struct QueryVocabularies {
-    pub all_terms_map: HashMap<Vec<u8>, u32>,
-    pub phrase_terms_map: HashMap<Vec<u8>, u16>,
+    pub all_terms_map: FastHashMap<Vec<u8>, u32>,
+    pub phrase_terms_map: FastHashMap<Vec<u8>, u16>,
     pub term_to_phrase_id: Vec<u16>,
 }
 
 impl QueryVocabularies {
     pub fn extract(queries_data: &[u8]) -> Self {
-        let mut all_set = HashSet::new();
-        let mut phrase_set = HashSet::new();
+        let mut all_set = FastHashSet::default();
+        let mut phrase_set = FastHashSet::default();
 
         for line in queries_data.split(|&b| b == b'\n') {
             let line = if line.ends_with(b"\r") {
@@ -101,12 +150,12 @@ impl QueryVocabularies {
             "Phrase vocabulary exceeds u16 limit!"
         );
 
-        let mut phrase_terms_map = HashMap::with_capacity(sorted_phrase.len());
+        let mut phrase_terms_map = FastHashMap::with_capacity_and_hasher(sorted_phrase.len(), FastBuildHasher::default());
         for (id, tok) in sorted_phrase.into_iter().enumerate() {
             phrase_terms_map.insert(tok, id as u16);
         }
 
-        let mut all_terms_map = HashMap::with_capacity(sorted_all.len());
+        let mut all_terms_map = FastHashMap::with_capacity_and_hasher(sorted_all.len(), FastBuildHasher::default());
         let mut term_to_phrase_id = Vec::with_capacity(sorted_all.len());
 
         for (id, tok) in sorted_all.into_iter().enumerate() {
@@ -540,6 +589,7 @@ pub fn partition_docs_data(docs_data: &[u8], num_chunks: usize) -> Vec<&[u8]> {
 #[derive(Clone)]
 pub struct BitSet {
     pub words: Vec<u64>,
+    pub scratch: Vec<u64>,
     pub num_docs: usize,
 }
 
@@ -548,6 +598,7 @@ impl BitSet {
         let num_words = (num_docs + 63) / 64;
         Self {
             words: vec![0u64; num_words],
+            scratch: vec![0u64; num_words],
             num_docs,
         }
     }
@@ -592,18 +643,18 @@ impl BitSet {
 
     #[inline]
     pub fn intersect_with_sparse(&mut self, list: &[u32]) {
-        let mut new_words = vec![0u64; self.words.len()];
+        self.scratch.fill(0);
         for &doc_id in list {
             let id = doc_id as usize;
             if id < self.num_docs {
                 let w_idx = id / 64;
                 let bit = 1u64 << (id % 64);
                 if (self.words[w_idx] & bit) != 0 {
-                    new_words[w_idx] |= bit;
+                    self.scratch[w_idx] |= bit;
                 }
             }
         }
-        self.words = new_words;
+        std::mem::swap(&mut self.words, &mut self.scratch);
     }
 
     #[inline]
@@ -796,7 +847,7 @@ impl QueryEvaluator {
                 let is_pure_and = clauses.iter().all(|(op, _)| *op == BoolOp::And);
 
                 if is_pure_and {
-                    // PLANNER OPTIMIZATION: Collect all terms, sort by cardinality (rarest first)
+                    // Collect all terms, sort by cardinality (rarest first)
                     self.sorted_and_terms.clear();
 
                     let first_tid = match corpus.vocab.get_term_id(first_term) {
@@ -829,7 +880,7 @@ impl QueryEvaluator {
                         self.sorted_and_terms.push((len, tid));
                     }
 
-                    // Sort terms: smallest posting list first!
+                    // Sort terms: smallest posting list first
                     self.sorted_and_terms.sort_unstable_by_key(|&(len, _)| len);
 
                     // Load rarest term
@@ -845,7 +896,7 @@ impl QueryEvaluator {
                                 }
                                 match corpus.get_postings(tid) {
                                     Some(PostingRef::Sparse(other)) => {
-                                        // Galloping / binary search intersection
+                                        // Binary search intersection
                                         self.candidate_docs
                                             .retain(|&id| other.binary_search(&id).is_ok());
                                     }
@@ -874,7 +925,7 @@ impl QueryEvaluator {
                             return;
                         }
                         Some(PostingRef::Dense(words)) => {
-                            // Rarest term is already dense -> all terms are dense!
+                            // Rarest term is dense -> all terms are dense
                             self.bitset.load_dense(words);
                             for &(_, tid) in &self.sorted_and_terms[1..] {
                                 match corpus.get_postings(tid) {
@@ -1108,6 +1159,47 @@ pub fn parallel_evaluate_queries(
     )
 }
 
+#[cfg(target_os = "linux")]
+fn mmap_file(file: &fs::File, len: usize) -> Result<&'static [u8], String> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let addr: *mut u8;
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            in("rax") 9usize, // sys_mmap
+            in("rdi") 0usize, // addr = NULL
+            in("rsi") len,   // length
+            in("rdx") 1usize, // PROT_READ
+            in("r10") 2usize, // MAP_PRIVATE
+            in("r8") fd,     // fd
+            in("r9") 0usize, // offset = 0
+            lateout("rax") addr,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if (addr as isize) < 0 && (addr as isize) > -4096 {
+        return Err(format!("mmap failed with errno {}", -(addr as isize)));
+    }
+    unsafe { Ok(std::slice::from_raw_parts(addr, len)) }
+}
+
+#[cfg(target_os = "linux")]
+fn munmap_file(data: &[u8]) {
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            in("rax") 11usize, // sys_munmap
+            in("rdi") data.as_ptr() as usize,
+            in("rsi") data.len(),
+            lateout("rax") _,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let data_dir = if args.len() > 1 { &args[1] } else { "/data" };
@@ -1127,7 +1219,6 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let queries_data = fs::read(&queries_path).expect("failed to read queries.txt");
-    let docs_data = fs::read(&docs_path).expect("failed to read docs.txt");
 
     let num_threads = env::var("RAYON_NUM_THREADS")
         .or_else(|_| env::var("THREADS"))
@@ -1146,15 +1237,30 @@ fn main() {
 
     let t_ingest_start = std::time::Instant::now();
     let vocab = QueryVocabularies::extract(&queries_data);
-    let corpus = CorpusIndex::build(&docs_data, vocab, ingest_threads).expect("corpus index build failed");
     let parsed_queries = parse_all_queries(&queries_data);
+    drop(queries_data);
+
+    // APPROACH B: Memory-mapped file input for docs.txt
+    let docs_file = fs::File::open(&docs_path).expect("failed to open docs.txt");
+    let docs_len = docs_file.metadata().expect("failed to get docs metadata").len() as usize;
+
+    let corpus = if docs_len > 0 {
+        let docs_data = mmap_file(&docs_file, docs_len).expect("mmap docs.txt failed");
+        let idx = CorpusIndex::build(docs_data, vocab, ingest_threads).expect("corpus index build failed");
+        munmap_file(docs_data);
+        drop(docs_file);
+        idx
+    } else {
+        drop(docs_file);
+        CorpusIndex::build(&[], vocab, ingest_threads).expect("corpus index build failed")
+    };
     let t_ingest = t_ingest_start.elapsed();
 
     let t_q_start = std::time::Instant::now();
     let (results, t_bool_cpu, t_phrase_cpu) = parallel_evaluate_queries(&corpus, &parsed_queries, num_threads);
     let t_query = t_q_start.elapsed();
 
-    let mut output_str = String::with_capacity(queries_data.len() * 2);
+    let mut output_str = String::with_capacity(parsed_queries.len() * 32);
     for res in &results {
         output_str.push_str(res);
     }
@@ -1171,7 +1277,7 @@ fn main() {
     let t_total = t0.elapsed();
 
     eprintln!(
-        "Index pipeline [Prototype C, threads={}, ingest_threads={}]: docs={}, queries={}, vocab_entries={}, stored_postings={}, ingest={:?}, query_wall={:?}, total={:?}",
+        "Index pipeline [V2-MMap, threads={}, ingest_threads={}]: docs={}, queries={}, vocab_entries={}, stored_postings={}, ingest={:?}, query_wall={:?}, total={:?}",
         num_threads, ingest_threads, corpus.num_docs, parsed_queries.len(), corpus.vocab.num_terms(), corpus.retained_postings_count(), t_ingest, t_query, t_total
     );
     eprintln!(
@@ -1181,7 +1287,7 @@ fn main() {
 
     if let Ok(status) = fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
-            if line.starts_with("VmHWM:") || line.starts_with("RssAnon:") || line.starts_with("RssFile:") {
+            if line.starts_with("VmHWM:") || line.starts_with("VmRSS:") || line.starts_with("RssAnon:") || line.starts_with("RssFile:") {
                 eprintln!("{}", line.trim());
             }
         }
