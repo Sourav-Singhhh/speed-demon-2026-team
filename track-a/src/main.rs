@@ -50,25 +50,69 @@ fn parse_hour_idx(ts: &[u8]) -> usize {
 #[inline(always)]
 fn fast_hash(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
-    for &b in bytes {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        let v = u64::from_ne_bytes(chunk.try_into().unwrap());
+        h = (h ^ v).wrapping_mul(0x100000001b3);
+    }
+    for &b in chunks.remainder() {
         h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
     }
     h
 }
 
-const HASH_TABLE_SIZE: usize = 4096;
+const HASH_TABLE_SIZE: usize = 8192;
 const HASH_MASK: usize = HASH_TABLE_SIZE - 1;
+
+const EP_SET_SIZE: usize = 8192;
+const EP_SET_MASK: usize = EP_SET_SIZE - 1;
+
+struct LocalEpSet<'a> {
+    keys: Vec<&'a [u8]>,
+    table_hashes: Box<[u64; EP_SET_SIZE]>,
+    table_ids: Box<[u16; EP_SET_SIZE]>,
+}
+
+impl<'a> LocalEpSet<'a> {
+    fn new() -> Self {
+        Self {
+            keys: Vec::with_capacity(2048),
+            table_hashes: Box::new([0u64; EP_SET_SIZE]),
+            table_ids: Box::new([0xffffu16; EP_SET_SIZE]),
+        }
+    }
+
+    #[inline(always)]
+    fn insert_if_absent(&mut self, ep: &'a [u8]) {
+        let h = fast_hash(ep);
+        let mut slot = (h as usize) & EP_SET_MASK;
+        loop {
+            let id = self.table_ids[slot];
+            if id == 0xffff {
+                let new_id = self.keys.len() as u16;
+                self.keys.push(ep);
+                self.table_ids[slot] = new_id;
+                self.table_hashes[slot] = h;
+                return;
+            }
+            if self.table_hashes[slot] == h && self.keys[id as usize] == ep {
+                return;
+            }
+            slot = (slot + 1) & EP_SET_MASK;
+        }
+    }
+}
 
 struct FastCatalog {
     keys: Vec<Vec<u8>>,
-    table_hashes: [u64; HASH_TABLE_SIZE],
-    table_ids: [u16; HASH_TABLE_SIZE],
+    table_hashes: Vec<u64>,
+    table_ids: Vec<u16>,
 }
 
 impl FastCatalog {
     fn new(sorted_endpoints: Vec<Vec<u8>>) -> Self {
-        let mut table_hashes = [0u64; HASH_TABLE_SIZE];
-        let mut table_ids = [0xffffu16; HASH_TABLE_SIZE];
+        let mut table_hashes = vec![0u64; HASH_TABLE_SIZE];
+        let mut table_ids = vec![0xffffu16; HASH_TABLE_SIZE];
 
         for (id, ep) in sorted_endpoints.iter().enumerate() {
             let h = fast_hash(ep);
@@ -191,7 +235,7 @@ fn main() {
         let mut handles = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
             handles.push(s.spawn(move || {
-                let mut endpoints: Vec<Vec<u8>> = Vec::with_capacity(2048);
+                let mut set = LocalEpSet::new();
                 let mut pos = 0;
                 while pos < chunk.len() {
                     let line_start = pos;
@@ -215,11 +259,9 @@ fn main() {
                         p += 1;
                     }
                     let ep = &line[ep_start..p];
-                    if !endpoints.iter().any(|existing| existing.as_slice() == ep) {
-                        endpoints.push(ep.to_vec());
-                    }
+                    set.insert_if_absent(ep);
                 }
-                endpoints
+                set.keys.into_iter().map(|s| s.to_vec()).collect::<Vec<Vec<u8>>>()
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -227,13 +269,10 @@ fn main() {
 
     let mut all_endpoints = Vec::with_capacity(2048);
     for list in local_catalogs {
-        for ep in list {
-            if !all_endpoints.iter().any(|existing| existing == &ep) {
-                all_endpoints.push(ep);
-            }
-        }
+        all_endpoints.extend(list);
     }
     all_endpoints.sort_unstable();
+    all_endpoints.dedup();
     let catalog = FastCatalog::new(all_endpoints);
 
     let num_endpoints = catalog.keys.len();
