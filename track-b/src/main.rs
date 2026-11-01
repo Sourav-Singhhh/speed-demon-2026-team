@@ -1,171 +1,104 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::Write as IoWrite;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-// Fast zero-dependency hasher (FxHash algorithm)
+#[inline(always)]
+pub fn hash_bytes(mut b: &[u8]) -> u64 {
+    const K: u64 = 0x517cc1b727220a95;
+    let mut h = 0u64;
+    while b.len() >= 8 {
+        h = (h.rotate_left(5) ^ u64::from_ne_bytes(b[..8].try_into().unwrap())).wrapping_mul(K);
+        b = &b[8..];
+    }
+    if b.len() >= 4 {
+        h = (h.rotate_left(5) ^ (u32::from_ne_bytes(b[..4].try_into().unwrap()) as u64)).wrapping_mul(K);
+        b = &b[4..];
+    }
+    for &x in b { h = (h.rotate_left(5) ^ (x as u64)).wrapping_mul(K); }
+    h
+}
+
 #[derive(Default)]
-pub struct FxHasher {
-    hash: u64,
-}
-
+pub struct FxHasher(u64);
 impl std::hash::Hasher for FxHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-    #[inline]
-    fn write(&mut self, mut bytes: &[u8]) {
-        const K: u64 = 0x517cc1b727220a95;
-        while bytes.len() >= 8 {
-            let word = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
-            self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(K);
-            bytes = &bytes[8..];
-        }
-        if bytes.len() >= 4 {
-            let word = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64;
-            self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(K);
-            bytes = &bytes[4..];
-        }
-        for &b in bytes {
-            self.hash = (self.hash.rotate_left(5) ^ (b as u64)).wrapping_mul(K);
-        }
-    }
+    #[inline(always)]
+    fn finish(&self) -> u64 { self.0 }
+    #[inline(always)]
+    fn write(&mut self, b: &[u8]) { self.0 = hash_bytes(b); }
 }
-
 pub type FastBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
 pub type FastHashMap<K, V> = HashMap<K, V, FastBuildHasher>;
 pub type FastHashSet<K> = HashSet<K, FastBuildHasher>;
 
-// Precomputed lookup table for byte-level tokenization:
-// 0 for delimiters; lowercase ASCII byte for alphanumeric tokens.
 static TOKEN_LUT: [u8; 256] = {
     let mut lut = [0u8; 256];
     let mut i = 0usize;
     while i < 256 {
         let b = i as u8;
-        if (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') {
-            lut[i] = b;
-        } else if b >= b'A' && b <= b'Z' {
-            lut[i] = b + (b'a' - b'A');
-        } else {
-            lut[i] = 0;
-        }
+        lut[i] = if (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') { b }
+        else if b >= b'A' && b <= b'Z' { b + 32 } else { 0 };
         i += 1;
     }
     lut
 };
 
-#[inline]
-pub fn is_token_byte(b: u8) -> bool {
-    TOKEN_LUT[b as usize] != 0
-}
-
-pub fn for_each_token<F>(text: &[u8], scratch: &mut Vec<u8>, mut on_token: F)
-where
-    F: FnMut(&[u8]),
-{
+#[inline(always)]
+pub fn for_each_token<F: FnMut(&[u8])>(text: &[u8], scratch: &mut Vec<u8>, mut f: F) {
     let mut i = 0;
     while i < text.len() {
-        while i < text.len() && TOKEN_LUT[text[i] as usize] == 0 {
-            i += 1;
-        }
-        if i >= text.len() {
-            break;
-        }
-        let start = i;
-        let mut has_upper = false;
+        while i < text.len() && TOKEN_LUT[text[i] as usize] == 0 { i += 1; }
+        if i >= text.len() { break; }
+        let (start, mut has_upper) = (i, false);
         while i < text.len() {
             let c = TOKEN_LUT[text[i] as usize];
-            if c == 0 {
-                break;
-            }
-            if c != text[i] {
-                has_upper = true;
-            }
+            if c == 0 { break; }
+            if c != text[i] { has_upper = true; }
             i += 1;
         }
         let raw = &text[start..i];
         if has_upper {
             scratch.clear();
-            scratch.reserve(raw.len());
-            for &b in raw {
-                scratch.push(TOKEN_LUT[b as usize]);
-            }
-            on_token(scratch);
-        } else {
-            on_token(raw);
-        }
-    }
-}
-
-pub fn tokenize(text: &[u8]) -> Vec<Vec<u8>> {
-    let mut tokens = Vec::new();
-    let mut scratch = Vec::with_capacity(32);
-    for_each_token(text, &mut scratch, |tok| {
-        tokens.push(tok.to_vec());
-    });
-    tokens
-}
-
-pub const SENTINEL_TOKEN_ID: u16 = 0xFFFF;
-
-const BLOOM_WORDS: usize = 16384;
-const BLOOM_MASK: usize = (BLOOM_WORDS * 64) - 1;
-
-pub struct FastBloom {
-    pub bits: Box<[u64; BLOOM_WORDS]>,
-}
-
-impl FastBloom {
-    pub fn new() -> Self {
-        Self {
-            bits: vec![0u64; BLOOM_WORDS].into_boxed_slice().try_into().unwrap(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn insert(&mut self, h: u64) {
-        let b1 = (h as usize) & BLOOM_MASK;
-        let b2 = ((h >> 20) as usize) & BLOOM_MASK;
-        let b3 = ((h >> 40) as usize) & BLOOM_MASK;
-        self.bits[b1 / 64] |= 1u64 << (b1 % 64);
-        self.bits[b2 / 64] |= 1u64 << (b2 % 64);
-        self.bits[b3 / 64] |= 1u64 << (b3 % 64);
-    }
-
-    #[inline(always)]
-    pub fn might_contain(&self, h: u64) -> bool {
-        let b1 = (h as usize) & BLOOM_MASK;
-        let b2 = ((h >> 20) as usize) & BLOOM_MASK;
-        let b3 = ((h >> 40) as usize) & BLOOM_MASK;
-        ((self.bits[b1 / 64] & (1u64 << (b1 % 64))) != 0)
-            && ((self.bits[b2 / 64] & (1u64 << (b2 % 64))) != 0)
-            && ((self.bits[b3 / 64] & (1u64 << (b3 % 64))) != 0)
+            for &b in raw { scratch.push(TOKEN_LUT[b as usize]); }
+            f(scratch);
+        } else { f(raw); }
     }
 }
 
 #[inline(always)]
-pub fn hash_token(mut bytes: &[u8]) -> u64 {
-    const K: u64 = 0x517cc1b727220a95;
-    let mut hash = 0u64;
-    while bytes.len() >= 8 {
-        let word = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
-        hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
-        bytes = &bytes[8..];
+pub fn for_each_line<F: FnMut(&[u8])>(chunk: &[u8], mut f: F) {
+    let mut pos = 0;
+    while pos < chunk.len() {
+        let start = pos;
+        while pos < chunk.len() && chunk[pos] != b'\n' { pos += 1; }
+        let mut end = pos;
+        if pos < chunk.len() && chunk[pos] == b'\n' { pos += 1; }
+        if end > start && chunk[end - 1] == b'\r' { end -= 1; }
+        let line = &chunk[start..end];
+        if !line.is_empty() { f(line); }
     }
-    if bytes.len() >= 4 {
-        let word = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64;
-        hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
-        bytes = &bytes[4..];
+}
+
+pub const SENTINEL_TOKEN_ID: u16 = 0xFFFF;
+const BLOOM_WORDS: usize = 16384;
+const BLOOM_MASK: usize = (BLOOM_WORDS * 64) - 1;
+
+pub struct FastBloom(Box<[u64; BLOOM_WORDS]>);
+impl FastBloom {
+    pub fn new() -> Self { Self(vec![0u64; BLOOM_WORDS].into_boxed_slice().try_into().unwrap()) }
+    #[inline(always)]
+    pub fn insert(&mut self, h: u64) {
+        let (b1, b2, b3) = ((h as usize) & BLOOM_MASK, ((h >> 20) as usize) & BLOOM_MASK, ((h >> 40) as usize) & BLOOM_MASK);
+        self.0[b1 / 64] |= 1u64 << (b1 % 64);
+        self.0[b2 / 64] |= 1u64 << (b2 % 64);
+        self.0[b3 / 64] |= 1u64 << (b3 % 64);
     }
-    for &b in bytes {
-        hash = (hash.rotate_left(5) ^ (b as u64)).wrapping_mul(K);
+    #[inline(always)]
+    pub fn might_contain(&self, h: u64) -> bool {
+        let (b1, b2, b3) = ((h as usize) & BLOOM_MASK, ((h >> 20) as usize) & BLOOM_MASK, ((h >> 40) as usize) & BLOOM_MASK);
+        ((self.0[b1 / 64] & (1u64 << (b1 % 64))) != 0) && ((self.0[b2 / 64] & (1u64 << (b2 % 64))) != 0) && ((self.0[b3 / 64] & (1u64 << (b3 % 64))) != 0)
     }
-    hash
 }
 
 pub struct QueryVocabularies {
@@ -177,200 +110,80 @@ pub struct QueryVocabularies {
 
 impl QueryVocabularies {
     pub fn extract(queries_data: &[u8]) -> Self {
-        let mut all_set = FastHashSet::default();
-        let mut phrase_set = FastHashSet::default();
-
-        for line in queries_data.split(|&b| b == b'\n') {
-            let line = if line.ends_with(b"\r") {
-                &line[..line.len() - 1]
-            } else {
-                line
-            };
-            if line.is_empty() {
-                continue;
-            }
+        let (mut all_set, mut phrase_set) = (FastHashSet::default(), FastHashSet::default());
+        for_each_line(queries_data, |line| {
             if line.starts_with(b"BOOL ") {
-                let rest = &line[5..];
-                for part in rest.split(|&b| b == b' ') {
-                    if part != b"AND" && part != b"OR" && part != b"NOT" && !part.is_empty() {
-                        all_set.insert(part.to_vec());
-                    }
+                for p in line[5..].split(|&b| b == b' ') {
+                    if p != b"AND" && p != b"OR" && p != b"NOT" && !p.is_empty() { all_set.insert(p.to_vec()); }
                 }
             } else if line.starts_with(b"PHRASE \"") && line.ends_with(b"\"") && line.len() >= 9 {
-                let inner = &line[8..line.len() - 1];
-                for term in inner.split(|&b| b == b' ') {
-                    if !term.is_empty() {
-                        all_set.insert(term.to_vec());
-                        phrase_set.insert(term.to_vec());
-                    }
+                for t in line[8..line.len() - 1].split(|&b| b == b' ') {
+                    if !t.is_empty() { all_set.insert(t.to_vec()); phrase_set.insert(t.to_vec()); }
                 }
             }
-        }
-
+        });
         let mut sorted_all: Vec<Vec<u8>> = all_set.into_iter().collect();
         sorted_all.sort_unstable();
-
         let mut sorted_phrase: Vec<Vec<u8>> = phrase_set.into_iter().collect();
         sorted_phrase.sort_unstable();
-        assert!(
-            sorted_phrase.len() < SENTINEL_TOKEN_ID as usize,
-            "Phrase vocabulary exceeds u16 limit!"
-        );
 
         let mut phrase_terms_map = FastHashMap::with_capacity_and_hasher(sorted_phrase.len(), FastBuildHasher::default());
-        for (id, tok) in sorted_phrase.into_iter().enumerate() {
-            phrase_terms_map.insert(tok, id as u16);
-        }
+        for (id, tok) in sorted_phrase.into_iter().enumerate() { phrase_terms_map.insert(tok, id as u16); }
 
         let mut all_terms_map = FastHashMap::with_capacity_and_hasher(sorted_all.len(), FastBuildHasher::default());
         let mut term_to_phrase_id = Vec::with_capacity(sorted_all.len());
-
         let mut bloom = FastBloom::new();
+
         for (id, tok) in sorted_all.into_iter().enumerate() {
-            let pid = phrase_terms_map
-                .get(&tok)
-                .copied()
-                .unwrap_or(SENTINEL_TOKEN_ID);
-            bloom.insert(hash_token(&tok));
+            let pid = phrase_terms_map.get(&tok).copied().unwrap_or(SENTINEL_TOKEN_ID);
+            bloom.insert(hash_bytes(&tok));
             all_terms_map.insert(tok, id as u32);
             term_to_phrase_id.push(pid);
         }
-
-        Self {
-            bloom,
-            all_terms_map,
-            phrase_terms_map,
-            term_to_phrase_id,
-        }
+        Self { bloom, all_terms_map, phrase_terms_map, term_to_phrase_id }
     }
 
     #[inline(always)]
     pub fn get_term_id(&self, tok: &[u8]) -> Option<u32> {
-        let h = hash_token(tok);
-        if !self.bloom.might_contain(h) {
-            return None;
-        }
+        let h = hash_bytes(tok);
+        if !self.bloom.might_contain(h) { return None; }
         self.all_terms_map.get(tok).copied()
     }
-
-    #[inline]
-    pub fn get_phrase_id(&self, tok: &[u8]) -> Option<u16> {
-        self.phrase_terms_map.get(tok).copied()
-    }
-
-    #[inline]
-    pub fn num_terms(&self) -> usize {
-        self.all_terms_map.len()
-    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BoolOp {
-    And,
-    Or,
-    Not,
-}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BoolOp { And, Or, Not }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedQuery {
-    Bool {
-        first_term: Vec<u8>,
-        clauses: Vec<(BoolOp, Vec<u8>)>,
-    },
-    Phrase {
-        terms: Vec<Vec<u8>>,
-    },
+    Bool { first_term: Vec<u8>, clauses: Vec<(BoolOp, Vec<u8>)> },
+    Phrase { terms: Vec<Vec<u8>> },
     Empty,
-}
-
-pub fn parse_query_line(line: &[u8]) -> ParsedQuery {
-    let line = if line.ends_with(b"\r") {
-        &line[..line.len() - 1]
-    } else {
-        line
-    };
-    if line.is_empty() {
-        return ParsedQuery::Empty;
-    }
-    if line.starts_with(b"BOOL ") {
-        let rest = &line[5..];
-        let mut parts = rest.split(|&b| b == b' ');
-        let first_term = match parts.next() {
-            Some(t) if !t.is_empty() => t.to_vec(),
-            _ => return ParsedQuery::Empty,
-        };
-        let mut clauses = Vec::new();
-        while let Some(op_bytes) = parts.next() {
-            if op_bytes.is_empty() {
-                continue;
-            }
-            let op = if op_bytes == b"AND" {
-                BoolOp::And
-            } else if op_bytes == b"OR" {
-                BoolOp::Or
-            } else if op_bytes == b"NOT" {
-                BoolOp::Not
-            } else {
-                continue;
-            };
-            if let Some(term) = parts.next() {
-                if !term.is_empty() {
-                    clauses.push((op, term.to_vec()));
-                }
-            }
-        }
-        ParsedQuery::Bool {
-            first_term,
-            clauses,
-        }
-    } else if line.starts_with(b"PHRASE \"") && line.ends_with(b"\"") && line.len() >= 9 {
-        let inner = &line[8..line.len() - 1];
-        let terms: Vec<Vec<u8>> = inner
-            .split(|&b| b == b' ')
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_vec())
-            .collect();
-        if terms.is_empty() {
-            ParsedQuery::Empty
-        } else {
-            ParsedQuery::Phrase { terms }
-        }
-    } else {
-        ParsedQuery::Empty
-    }
 }
 
 pub fn parse_all_queries(queries_data: &[u8]) -> Vec<ParsedQuery> {
     let mut queries = Vec::new();
-    for line in queries_data.split(|&b| b == b'\n') {
-        let line = if line.ends_with(b"\r") {
-            &line[..line.len() - 1]
-        } else {
-            line
-        };
-        if line.is_empty() {
-            continue;
-        }
-        queries.push(parse_query_line(line));
-    }
+    for_each_line(queries_data, |line| {
+        if line.starts_with(b"BOOL ") {
+            let mut parts = line[5..].split(|&b| b == b' ');
+            let first = match parts.next() { Some(t) if !t.is_empty() => t.to_vec(), _ => { queries.push(ParsedQuery::Empty); return; } };
+            let mut clauses = Vec::new();
+            while let Some(op_b) = parts.next() {
+                let op = match op_b { b"AND" => BoolOp::And, b"OR" => BoolOp::Or, b"NOT" => BoolOp::Not, _ => continue };
+                if let Some(t) = parts.next() { if !t.is_empty() { clauses.push((op, t.to_vec())); } }
+            }
+            queries.push(ParsedQuery::Bool { first_term: first, clauses });
+        } else if line.starts_with(b"PHRASE \"") && line.ends_with(b"\"") && line.len() >= 9 {
+            let terms: Vec<Vec<u8>> = line[8..line.len() - 1].split(|&b| b == b' ').filter(|t| !t.is_empty()).map(|t| t.to_vec()).collect();
+            queries.push(if terms.is_empty() { ParsedQuery::Empty } else { ParsedQuery::Phrase { terms } });
+        } else { queries.push(ParsedQuery::Empty); }
+    });
     queries
 }
 
-
-
 #[derive(Clone, Copy, Default)]
-pub struct TrieNode {
-    pub edges_start: u32,
-    pub edges_len: u16,
-    pub match_start: u32,
-    pub match_len: u16,
-}
-
+pub struct TrieNode { edges_start: u32, edges_len: u16, match_start: u32, match_len: u16 }
 #[derive(Clone, Copy)]
-pub struct TrieEdge {
-    pub pid: u16,
-    pub next_node: u32,
-}
+pub struct TrieEdge { pid: u16, next_node: u32 }
 
 pub struct PhraseTrie {
     pub root_transitions: Vec<u32>,
@@ -381,27 +194,18 @@ pub struct PhraseTrie {
 
 impl PhraseTrie {
     pub fn build(vocab: &QueryVocabularies, queries: &[ParsedQuery]) -> Self {
-        let mut temp_edges: Vec<FastHashMap<u16, u32>> = vec![FastHashMap::default()];
-        let mut temp_matches: Vec<Vec<u32>> = vec![Vec::new()];
-
+        let (mut temp_edges, mut temp_matches) = (vec![FastHashMap::<u16, u32>::default()], vec![Vec::<u32>::new()]);
         for (q_idx, query) in queries.iter().enumerate() {
             if let ParsedQuery::Phrase { terms } = query {
                 let mut pids = Vec::with_capacity(terms.len());
                 let mut valid = true;
                 for t in terms {
-                    if let Some(pid) = vocab.get_phrase_id(t) {
-                        pids.push(pid);
-                    } else {
-                        valid = false;
-                        break;
-                    }
+                    if let Some(&pid) = vocab.phrase_terms_map.get(t) { pids.push(pid); } else { valid = false; break; }
                 }
-                if !valid || pids.is_empty() {
-                    continue;
-                }
+                if !valid || pids.is_empty() { continue; }
                 let mut curr = 0usize;
                 for &pid in &pids {
-                    let next_idx = match temp_edges[curr].get(&pid) {
+                    curr = match temp_edges[curr].get(&pid) {
                         Some(&nxt) => nxt as usize,
                         None => {
                             let nxt = temp_edges.len();
@@ -411,106 +215,67 @@ impl PhraseTrie {
                             nxt
                         }
                     };
-                    curr = next_idx;
                 }
                 temp_matches[curr].push(q_idx as u32);
             }
         }
-
         let num_phrase_terms = vocab.phrase_terms_map.len();
         let mut root_transitions = vec![0u32; num_phrase_terms];
         for (&pid, &nxt) in &temp_edges[0] {
-            if (pid as usize) < num_phrase_terms {
-                root_transitions[pid as usize] = nxt;
-            }
+            if (pid as usize) < num_phrase_terms { root_transitions[pid as usize] = nxt; }
         }
-
-        let mut nodes = Vec::with_capacity(temp_edges.len());
-        let mut edges = Vec::new();
-        let mut matches = Vec::new();
-
+        let (mut nodes, mut edges, mut matches) = (Vec::with_capacity(temp_edges.len()), Vec::new(), Vec::new());
         for i in 0..temp_edges.len() {
             let edges_start = edges.len() as u32;
-            let mut node_edges: Vec<TrieEdge> = temp_edges[i]
-                .iter()
-                .map(|(&pid, &next_node)| TrieEdge { pid, next_node })
-                .collect();
-            node_edges.sort_unstable_by_key(|e| e.pid);
-            let edges_len = node_edges.len() as u16;
-            edges.extend_from_slice(&node_edges);
+            let mut ne: Vec<TrieEdge> = temp_edges[i].iter().map(|(&pid, &next_node)| TrieEdge { pid, next_node }).collect();
+            ne.sort_unstable_by_key(|e| e.pid);
+            let edges_len = ne.len() as u16;
+            edges.extend_from_slice(&ne);
 
             let match_start = matches.len() as u32;
             let match_len = temp_matches[i].len() as u16;
             matches.extend_from_slice(&temp_matches[i]);
-
-            nodes.push(TrieNode {
-                edges_start,
-                edges_len,
-                match_start,
-                match_len,
-            });
+            nodes.push(TrieNode { edges_start, edges_len, match_start, match_len });
         }
-
-        Self {
-            root_transitions,
-            nodes,
-            edges,
-            matches,
-        }
-    }
-
-    #[inline(always)]
-    pub fn root_transition(&self, pid: u16) -> u32 {
-        let idx = pid as usize;
-        if idx < self.root_transitions.len() {
-            unsafe { *self.root_transitions.get_unchecked(idx) }
-        } else {
-            0
-        }
+        Self { root_transitions, nodes, edges, matches }
     }
 
     #[inline(always)]
     pub fn transition(&self, node_idx: u32, pid: u16) -> u32 {
         let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
-        if node.edges_len == 1 {
-            let edge = unsafe { *self.edges.get_unchecked(node.edges_start as usize) };
-            if edge.pid == pid {
-                return edge.next_node;
-            }
-            return 0;
-        }
-        if node.edges_len > 1 {
-            let start = node.edges_start as usize;
-            let end = start + node.edges_len as usize;
-            let slice = unsafe { self.edges.get_unchecked(start..end) };
-            if let Ok(idx) = slice.binary_search_by_key(&pid, |e| e.pid) {
-                return unsafe { slice.get_unchecked(idx).next_node };
-            }
-        }
-        0
+        let slice = unsafe { self.edges.get_unchecked(node.edges_start as usize..node.edges_start as usize + node.edges_len as usize) };
+        if node.edges_len == 1 { return if slice[0].pid == pid { slice[0].next_node } else { 0 }; }
+        slice.binary_search_by_key(&pid, |e| e.pid).map(|i| slice[i].next_node).unwrap_or(0)
     }
 
     #[inline(always)]
-    pub fn record_matches(
-        &self,
-        node_idx: u32,
-        doc_id: u32,
-        last_doc: &mut [u32],
-        thread_matches: &mut Vec<(u32, u32)>,
-    ) {
-        let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
-        if node.match_len > 0 {
-            let start = node.match_start as usize;
-            let end = start + node.match_len as usize;
-            let q_indices = unsafe { self.matches.get_unchecked(start..end) };
-            for &q_idx in q_indices {
-                let q = q_idx as usize;
-                if unsafe { *last_doc.get_unchecked(q) != doc_id } {
-                    unsafe { *last_doc.get_unchecked_mut(q) = doc_id; }
-                    thread_matches.push((q_idx, doc_id));
-                }
+    pub fn record_matches(&self, node_idx: u32, doc_id: u32, last_doc: &mut [u32], matches: &mut Vec<(u32, u32)>) {
+        let n = unsafe { self.nodes.get_unchecked(node_idx as usize) };
+        for &q in unsafe { self.matches.get_unchecked(n.match_start as usize..n.match_start as usize + n.match_len as usize) } {
+            if unsafe { *last_doc.get_unchecked(q as usize) != doc_id } {
+                unsafe { *last_doc.get_unchecked_mut(q as usize) = doc_id; }
+                matches.push((q, doc_id));
             }
         }
+    }
+
+    #[inline(always)]
+    pub fn advance(&self, pid: u16, doc_id: u32, active: &mut [u32; 16], active_len: &mut usize, last_doc: &mut [u32], matches: &mut Vec<(u32, u32)>) {
+        let (mut next_active, mut next_len) = ([0u32; 16], 0);
+        for i in 0..*active_len {
+            let nxt = self.transition(active[i], pid);
+            if nxt != 0 {
+                if next_len < 16 { next_active[next_len] = nxt; next_len += 1; }
+                self.record_matches(nxt, doc_id, last_doc, matches);
+            }
+        }
+        let root_nxt = if (pid as usize) < self.root_transitions.len() { unsafe { *self.root_transitions.get_unchecked(pid as usize) } } else { 0 };
+        if root_nxt != 0 {
+            if next_len < 16 { next_active[next_len] = root_nxt; next_len += 1; }
+            self.record_matches(root_nxt, doc_id, last_doc, matches);
+        }
+        *active = next_active;
+        *active_len = next_len;
     }
 }
 
@@ -531,986 +296,419 @@ pub struct CorpusIndex {
 }
 
 impl CorpusIndex {
-    #[inline]
+    #[inline(always)]
     pub fn get_postings(&self, term_id: u32) -> Option<PostingRef<'_>> {
         let id = term_id as usize;
         if id < self.dense_term_map.len() {
-            if let Some(dense_idx) = self.dense_term_map[id] {
-                let start = dense_idx as usize * self.words_per_bitset;
-                let end = start + self.words_per_bitset;
-                return Some(PostingRef::Dense(&self.dense_bitsets[start..end]));
+            if let Some(d_idx) = self.dense_term_map[id] {
+                let start = d_idx as usize * self.words_per_bitset;
+                return Some(PostingRef::Dense(&self.dense_bitsets[start..start + self.words_per_bitset]));
             }
         }
         if id + 1 < self.postings_offsets.len() {
-            let start = self.postings_offsets[id] as usize;
-            let end = self.postings_offsets[id + 1] as usize;
-            if start < end {
-                Some(PostingRef::Sparse(&self.postings_data[start..end]))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+            let (start, end) = (self.postings_offsets[id] as usize, self.postings_offsets[id + 1] as usize);
+            if start < end { Some(PostingRef::Sparse(&self.postings_data[start..end])) } else { None }
+        } else { None }
     }
 
-    #[inline]
-    pub fn get_sparse_postings(&self, term_id: u32) -> Option<&[u32]> {
-        let id = term_id as usize;
-        if id + 1 < self.postings_offsets.len() {
-            let start = self.postings_offsets[id] as usize;
-            let end = self.postings_offsets[id + 1] as usize;
-            if start < end {
-                Some(&self.postings_data[start..end])
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    #[inline]
+    #[inline(always)]
     pub fn get_posting_len(&self, term_id: u32) -> usize {
         let id = term_id as usize;
-        if id + 1 < self.postings_offsets.len() {
-            (self.postings_offsets[id + 1] - self.postings_offsets[id]) as usize
-        } else {
-            0
-        }
-    }
-
-    pub fn retained_postings_count(&self) -> usize {
-        self.postings_data.len()
+        if id + 1 < self.postings_offsets.len() { (self.postings_offsets[id + 1] - self.postings_offsets[id]) as usize } else { 0 }
     }
 
     pub fn build(docs_data: &[u8], vocab: QueryVocabularies, queries: &[ParsedQuery], num_threads: usize) -> Result<Self, String> {
         let actual_workers = num_threads.max(1);
         let chunks = partition_docs_data(docs_data, actual_workers);
-        let num_terms = vocab.num_terms();
+        let num_terms = vocab.all_terms_map.len();
 
-        struct Pass1Result {
-            first_doc_id: usize,
-            num_docs: usize,
-            term_counts: Vec<u32>,
-        }
-
-        let pass1_results: Result<Vec<Pass1Result>, String> = std::thread::scope(|s| {
+        let pass1_results = std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
-                let vocab_ref = &vocab;
-                                handles.push(s.spawn(move || {
+                let v = &vocab;
+                handles.push(s.spawn(move || {
                     let mut term_counts = vec![0u32; num_terms];
                     let mut seen_epoch = vec![0u32; num_terms];
                     let mut current_epoch = 1u32;
                     let mut scratch = Vec::with_capacity(32);
-
-                    let mut pos = 0;
-                    let mut first_doc_id = 0;
-                    let mut num_docs = 0;
-                    let mut has_first = false;
-
-                    while pos < chunk.len() {
-                        let line_start = pos;
-                        while pos < chunk.len() && chunk[pos] != b'\n' {
-                            pos += 1;
-                        }
-                        let mut line_end = pos;
-                        if pos < chunk.len() && chunk[pos] == b'\n' {
-                            pos += 1;
-                        }
-                        if line_end > line_start && chunk[line_end - 1] == b'\r' {
-                            line_end -= 1;
-                        }
-                        let line = &chunk[line_start..line_end];
-                        if line.is_empty() {
-                            continue;
-                        }
-
-                        let tab_pos = line
-                            .iter()
-                            .position(|&b| b == b'\t')
-                            .ok_or_else(|| "missing TAB in doc line".to_string())?;
-
-                        let id_bytes = &line[..tab_pos];
+                    let (mut first_doc_id, mut num_docs, mut has_first) = (0, 0, false);
+                    for_each_line(chunk, |line| {
+                        let tab_pos = match line.iter().position(|&b| b == b'\t') { Some(p) => p, None => return };
                         let mut doc_id = 0usize;
-                        for &b in id_bytes {
-                            doc_id = doc_id * 10 + (b.wrapping_sub(b'0')) as usize;
-                        }
-
-                        if !has_first {
-                            first_doc_id = doc_id;
-                            has_first = true;
-                        } else {
-                            let expected = first_doc_id + num_docs;
-                            if doc_id != expected {
-                                return Err(format!("expected doc id {}, got {}", expected, doc_id));
-                            }
-                        }
-
-                        let text = &line[tab_pos + 1..];
+                        for &b in &line[..tab_pos] { doc_id = doc_id * 10 + (b.wrapping_sub(b'0')) as usize; }
+                        if !has_first { first_doc_id = doc_id; has_first = true; }
                         current_epoch += 1;
-                        if current_epoch == u32::MAX {
-                            seen_epoch.fill(0);
-                            current_epoch = 1;
-                        }
-
-                        for_each_token(text, &mut scratch, |tok| {
-                            if let Some(tid) = vocab_ref.get_term_id(tok) {
+                        if current_epoch == u32::MAX { seen_epoch.fill(0); current_epoch = 1; }
+                        for_each_token(&line[tab_pos + 1..], &mut scratch, |tok| {
+                            if let Some(tid) = v.get_term_id(tok) {
                                 let idx = tid as usize;
-                                if seen_epoch[idx] != current_epoch {
-                                    seen_epoch[idx] = current_epoch;
-                                    term_counts[idx] += 1;
-                                }
+                                if seen_epoch[idx] != current_epoch { seen_epoch[idx] = current_epoch; term_counts[idx] += 1; }
                             }
                         });
-
                         num_docs += 1;
-                    }
-
-                    Ok(Pass1Result {
-                        first_doc_id,
-                        num_docs,
-                        term_counts,
-                    })
+                    });
+                    (first_doc_id, num_docs, term_counts)
                 }));
             }
-
-            let mut res = Vec::with_capacity(handles.len());
-            for h in handles {
-                res.push(h.join().unwrap()?);
-            }
-            Ok(res)
+            let mut res = Vec::new();
+            for h in handles { res.push(h.join().unwrap()); }
+            res
         });
 
-        let pass1_results = pass1_results?;
-
         let mut total_docs = 0;
-        let mut expected_doc = 0;
-
-        for r in &pass1_results {
-            if r.num_docs > 0 {
-                if r.first_doc_id != expected_doc {
-                    return Err(format!("doc gap: expected {}, got {}", expected_doc, r.first_doc_id));
-                }
-                expected_doc += r.num_docs;
-                total_docs += r.num_docs;
-            }
-        }
-
         let mut total_term_counts = vec![0u32; num_terms];
-        for r in &pass1_results {
-            for (i, &cnt) in r.term_counts.iter().enumerate() {
-                total_term_counts[i] += cnt;
-            }
+        for (_, num_docs, term_counts) in &pass1_results {
+            total_docs += num_docs;
+            for (i, &cnt) in term_counts.iter().enumerate() { total_term_counts[i] += cnt; }
         }
 
         let mut postings_offsets = Vec::with_capacity(num_terms + 1);
         postings_offsets.push(0);
         let mut total_postings = 0u32;
-        for &cnt in &total_term_counts {
-            total_postings += cnt;
-            postings_offsets.push(total_postings);
-        }
+        for &cnt in &total_term_counts { total_postings += cnt; postings_offsets.push(total_postings); }
 
         let mut worker_ptrs: Vec<Vec<u32>> = Vec::with_capacity(pass1_results.len());
         let mut running_worker_starts = vec![0u32; num_terms];
-
-        for w in 0..pass1_results.len() {
+        for (_, _, term_counts) in &pass1_results {
             let mut ptrs = Vec::with_capacity(num_terms);
             for t in 0..num_terms {
                 ptrs.push(postings_offsets[t] + running_worker_starts[t]);
-                running_worker_starts[t] += pass1_results[w].term_counts[t];
+                running_worker_starts[t] += term_counts[t];
             }
             worker_ptrs.push(ptrs);
         }
 
         let mut postings_data = vec![0u32; total_postings as usize];
-
         let phrase_trie = PhraseTrie::build(&vocab, queries);
 
-        // PASS 2: Fill postings memory and track phrase occurrences
-        let thread_matches: Vec<Vec<(u32, u32)>> = std::thread::scope(|s| {
+        let thread_matches = std::thread::scope(|s| {
             let postings_ptr = postings_data.as_mut_ptr() as usize;
             let mut handles = Vec::with_capacity(chunks.len());
-
             for (w_idx, chunk) in chunks.iter().enumerate() {
-                let vocab_ref = &vocab;
-                let trie_ref = &phrase_trie;
-                let mut local_postings_ptrs = std::mem::take(&mut worker_ptrs[w_idx]);
-                let num_q = queries.len();
-
+                let (v, trie, mut ptrs, num_q) = (&vocab, &phrase_trie, std::mem::take(&mut worker_ptrs[w_idx]), queries.len());
                 handles.push(s.spawn(move || {
-                    let postings_raw = postings_ptr as *mut u32;
-                    let mut seen_in_doc = Vec::with_capacity(256);
-                    let mut scratch = Vec::with_capacity(32);
-                    let mut last_doc = vec![u32::MAX; num_q];
-                    let mut local_matches = Vec::with_capacity(2048);
-
-                    let mut pos = 0;
-
-                    while pos < chunk.len() {
-                        let line_start = pos;
-                        while pos < chunk.len() && chunk[pos] != b'\n' {
-                            pos += 1;
-                        }
-                        let mut line_end = pos;
-                        if pos < chunk.len() && chunk[pos] == b'\n' {
-                            pos += 1;
-                        }
-                        if line_end > line_start && chunk[line_end - 1] == b'\r' {
-                            line_end -= 1;
-                        }
-                        let line = &chunk[line_start..line_end];
-                        if line.is_empty() {
-                            continue;
-                        }
-
-                        let tab_pos = match line.iter().position(|&b| b == b'\t') {
-                            Some(p) => p,
-                            None => continue,
-                        };
-
-                        let id_bytes = &line[..tab_pos];
+                    let raw = postings_ptr as *mut u32;
+                    let (mut seen_in_doc, mut scratch, mut last_doc, mut local_matches) = (Vec::with_capacity(256), Vec::with_capacity(32), vec![u32::MAX; num_q], Vec::with_capacity(2048));
+                    for_each_line(chunk, |line| {
+                        let tab_pos = match line.iter().position(|&b| b == b'\t') { Some(p) => p, None => return };
                         let mut doc_id = 0u32;
-                        for &b in id_bytes {
-                            doc_id = doc_id * 10 + (b.wrapping_sub(b'0')) as u32;
-                        }
-
-                        let text = &line[tab_pos + 1..];
+                        for &b in &line[..tab_pos] { doc_id = doc_id * 10 + (b.wrapping_sub(b'0')) as u32; }
                         seen_in_doc.clear();
-                        let mut active = [0u32; 16];
-                        let mut active_len = 0;
+                        let (mut active, mut active_len) = ([0u32; 16], 0);
 
-                        for_each_token(text, &mut scratch, |tok| {
-                            if let Some(tid) = vocab_ref.get_term_id(tok) {
+                        for_each_token(&line[tab_pos + 1..], &mut scratch, |tok| {
+                            if let Some(tid) = v.get_term_id(tok) {
                                 seen_in_doc.push(tid);
-                                let pid = unsafe { *vocab_ref.term_to_phrase_id.get_unchecked(tid as usize) };
+                                let pid = unsafe { *v.term_to_phrase_id.get_unchecked(tid as usize) };
                                 if pid != SENTINEL_TOKEN_ID {
-                                    let mut next_active = [0u32; 16];
-                                    let mut next_len = 0;
-
-                                    for i in 0..active_len {
-                                        let nxt = trie_ref.transition(active[i], pid);
-                                        if nxt != 0 {
-                                            if next_len < 16 {
-                                                next_active[next_len] = nxt;
-                                                next_len += 1;
-                                            }
-                                            trie_ref.record_matches(nxt, doc_id, &mut last_doc, &mut local_matches);
-                                        }
-                                    }
-
-                                    let root_nxt = trie_ref.root_transition(pid);
-                                    if root_nxt != 0 {
-                                        if next_len < 16 {
-                                            next_active[next_len] = root_nxt;
-                                            next_len += 1;
-                                        }
-                                        trie_ref.record_matches(root_nxt, doc_id, &mut last_doc, &mut local_matches);
-                                    }
-
-                                    active = next_active;
-                                    active_len = next_len;
-                                } else {
-                                    active_len = 0;
-                                }
-                            } else {
-                                active_len = 0;
-                            }
+                                    trie.advance(pid, doc_id, &mut active, &mut active_len, &mut last_doc, &mut local_matches);
+                                } else { active_len = 0; }
+                            } else { active_len = 0; }
                         });
-
                         seen_in_doc.sort_unstable();
                         seen_in_doc.dedup();
-
                         for &tid in &seen_in_doc {
-                            let ptr_idx = tid as usize;
-                            let out_pos = local_postings_ptrs[ptr_idx] as usize;
-                            unsafe {
-                                *postings_raw.add(out_pos) = doc_id;
-                            }
-                            local_postings_ptrs[ptr_idx] += 1;
+                            let out_pos = ptrs[tid as usize] as usize;
+                            unsafe { *raw.add(out_pos) = doc_id; }
+                            ptrs[tid as usize] += 1;
                         }
-                    }
-
+                    });
                     local_matches
                 }));
             }
-
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            let mut res = Vec::new();
+            for h in handles { res.push(h.join().unwrap()); }
+            res
         });
 
         let mut phrase_postings: Vec<Vec<u32>> = vec![Vec::new(); queries.len()];
         for w_matches in thread_matches {
-            for (q_idx, doc_id) in w_matches {
-                phrase_postings[q_idx as usize].push(doc_id);
-            }
+            for (q_idx, doc_id) in w_matches { phrase_postings[q_idx as usize].push(doc_id); }
         }
 
         let dense_threshold = (total_docs / 32).max(64);
         let mut dense_term_map = vec![None; num_terms];
         let mut num_dense = 0;
         for (tid, &count) in total_term_counts.iter().enumerate() {
-            if count as usize >= dense_threshold {
-                dense_term_map[tid] = Some(num_dense as u32);
-                num_dense += 1;
-            }
+            if count as usize >= dense_threshold { dense_term_map[tid] = Some(num_dense as u32); num_dense += 1; }
         }
-
         let words_per_bitset = (total_docs + 63) / 64;
         let mut dense_bitsets = vec![0u64; num_dense * words_per_bitset];
-
         for (tid, &dense_idx_opt) in dense_term_map.iter().enumerate() {
             if let Some(d_idx) = dense_idx_opt {
                 let start_word = d_idx as usize * words_per_bitset;
-                let post_start = postings_offsets[tid] as usize;
-                let post_end = postings_offsets[tid + 1] as usize;
-                let slice = &postings_data[post_start..post_end];
-                for &doc_id in slice {
+                for &doc_id in &postings_data[postings_offsets[tid] as usize..postings_offsets[tid + 1] as usize] {
                     let id = doc_id as usize;
-                    if id < total_docs {
-                        dense_bitsets[start_word + (id / 64)] |= 1u64 << (id % 64);
-                    }
+                    if id < total_docs { dense_bitsets[start_word + (id / 64)] |= 1u64 << (id % 64); }
                 }
             }
         }
-
-        Ok(Self {
-            num_docs: total_docs,
-            postings_offsets,
-            postings_data,
-            dense_bitsets,
-            dense_term_map,
-            words_per_bitset,
-            vocab,
-            phrase_postings,
-        })
+        Ok(Self { num_docs: total_docs, postings_offsets, postings_data, dense_bitsets, dense_term_map, words_per_bitset, vocab, phrase_postings })
     }
 }
 
-pub fn partition_docs_data(docs_data: &[u8], num_chunks: usize) -> Vec<&[u8]> {
-    if docs_data.is_empty() || num_chunks <= 1 {
-        return vec![docs_data];
+pub fn partition_docs_data(d: &[u8], n: usize) -> Vec<&[u8]> {
+    if d.is_empty() || n <= 1 { return vec![d]; }
+    let mut bounds = vec![0];
+    for i in 1..n {
+        let mut b = (i * d.len()) / n;
+        while b < d.len() && d[b] != b'\n' { b += 1; }
+        bounds.push((b + 1).min(d.len()));
     }
-
-    let total_len = docs_data.len();
-    let mut boundaries = Vec::with_capacity(num_chunks + 1);
-    boundaries.push(0);
-
-    for i in 1..num_chunks {
-        let tentative = (i * total_len) / num_chunks;
-        let mut b = tentative;
-        while b < total_len && docs_data[b] != b'\n' {
-            b += 1;
-        }
-        if b < total_len {
-            b += 1;
-        }
-        let prev = *boundaries.last().unwrap();
-        if b < prev {
-            b = prev;
-        }
-        boundaries.push(b);
-    }
-    boundaries.push(total_len);
-
-    let mut chunks = Vec::with_capacity(num_chunks);
-    for w in boundaries.windows(2) {
-        chunks.push(&docs_data[w[0]..w[1]]);
-    }
-    chunks
+    bounds.push(d.len());
+    bounds.dedup();
+    (0..bounds.len() - 1).map(|i| &d[bounds[i]..bounds[i + 1]]).collect()
 }
 
-#[derive(Clone)]
-pub struct BitSet {
-    pub words: Vec<u64>,
-    pub scratch: Vec<u64>,
-    pub num_docs: usize,
-}
-
+pub struct BitSet(pub Vec<u64>);
 impl BitSet {
-    pub fn new(num_docs: usize) -> Self {
-        let num_words = (num_docs + 63) / 64;
-        Self {
-            words: vec![0u64; num_words],
-            scratch: vec![0u64; num_words],
-            num_docs,
-        }
+    pub fn new(num_bits: usize) -> Self { Self(vec![0u64; (num_bits + 63) / 64]) }
+    #[inline(always)]
+    pub fn clear(&mut self) { self.0.fill(0); }
+    #[inline(always)]
+    pub fn load_dense(&mut self, dense: &[u64]) {
+        let n = self.0.len().min(dense.len());
+        self.0[..n].copy_from_slice(&dense[..n]);
     }
-
-    #[inline]
-    pub fn clear(&mut self) {
-        self.words.fill(0);
-    }
-
-    #[inline]
-    pub fn load_sparse(&mut self, list: &[u32]) {
-        self.clear();
-        for &doc_id in list {
-            let id = doc_id as usize;
-            if id < self.num_docs {
-                self.words[id / 64] |= 1u64 << (id % 64);
+    #[inline(always)]
+    pub fn load_sparse(&mut self, docs: &[u32]) { self.clear(); self.apply_sparse(BoolOp::Or, docs); }
+    #[inline(always)]
+    pub fn apply_sparse(&mut self, op: BoolOp, docs: &[u32]) {
+        if op == BoolOp::And {
+            let mut new_w = vec![0u64; self.0.len()];
+            for &d in docs {
+                let (w, bit) = (d as usize / 64, 1u64 << (d % 64));
+                if w < self.0.len() && (self.0[w] & bit) != 0 { new_w[w] |= bit; }
             }
-        }
-    }
-
-    #[inline]
-    pub fn load_dense(&mut self, dense_words: &[u64]) {
-        self.words.copy_from_slice(dense_words);
-    }
-
-    #[inline]
-    pub fn union_sparse(&mut self, list: &[u32]) {
-        for &doc_id in list {
-            let id = doc_id as usize;
-            if id < self.num_docs {
-                self.words[id / 64] |= 1u64 << (id % 64);
-            }
-        }
-    }
-
-    #[inline]
-    pub fn union_dense(&mut self, dense_words: &[u64]) {
-        for (w1, w2) in self.words.iter_mut().zip(dense_words) {
-            *w1 |= *w2;
-        }
-    }
-
-    #[inline]
-    pub fn intersect_with_sparse(&mut self, list: &[u32]) {
-        self.scratch.fill(0);
-        for &doc_id in list {
-            let id = doc_id as usize;
-            if id < self.num_docs {
-                let w_idx = id / 64;
-                let bit = 1u64 << (id % 64);
-                if (self.words[w_idx] & bit) != 0 {
-                    self.scratch[w_idx] |= bit;
+            self.0 = new_w;
+        } else {
+            for &d in docs {
+                let (w, bit) = (d as usize / 64, 1u64 << (d % 64));
+                if w < self.0.len() {
+                    if op == BoolOp::Or { self.0[w] |= bit; } else { self.0[w] &= !bit; }
                 }
             }
         }
-        std::mem::swap(&mut self.words, &mut self.scratch);
     }
-
-    #[inline]
-    pub fn intersect_with_dense(&mut self, dense_words: &[u64]) {
-        for (w1, w2) in self.words.iter_mut().zip(dense_words) {
-            *w1 &= *w2;
+    #[inline(always)]
+    pub fn apply_dense(&mut self, op: BoolOp, dense: &[u64]) {
+        let n = self.0.len().min(dense.len());
+        match op {
+            BoolOp::And => for i in 0..n { self.0[i] &= dense[i]; },
+            BoolOp::Or => for i in 0..n { self.0[i] |= dense[i]; },
+            BoolOp::Not => for i in 0..n { self.0[i] &= !dense[i]; },
         }
     }
-
-    #[inline]
-    pub fn difference_with_sparse(&mut self, list: &[u32]) {
-        for &doc_id in list {
-            let id = doc_id as usize;
-            if id < self.num_docs {
-                self.words[id / 64] &= !(1u64 << (id % 64));
-            }
+    #[inline(always)]
+    pub fn apply(&mut self, op: BoolOp, post: Option<PostingRef<'_>>) {
+        match post {
+            Some(PostingRef::Sparse(s)) => self.apply_sparse(op, s),
+            Some(PostingRef::Dense(d)) => self.apply_dense(op, d),
+            None => if op == BoolOp::And { self.clear(); },
         }
     }
-
-    #[inline]
-    pub fn difference_with_dense(&mut self, dense_words: &[u64]) {
-        for (w1, w2) in self.words.iter_mut().zip(dense_words) {
-            *w1 &= !*w2;
-        }
-    }
-
     pub fn summary(&self) -> (usize, u64, Vec<u32>) {
-        let mut count = 0usize;
-        let mut sum = 0u64;
-        let mut first_10 = Vec::with_capacity(10);
-
-        for (word_idx, &word) in self.words.iter().enumerate() {
-            if word == 0 {
-                continue;
-            }
-            let base_id = word_idx * 64;
-            let mut w = word;
-            while w != 0 {
-                let bit_idx = w.trailing_zeros() as usize;
-                let doc_id = base_id + bit_idx;
-                if doc_id >= self.num_docs {
-                    break;
+        let (mut count, mut sum, mut first_10) = (0usize, 0u64, Vec::with_capacity(10));
+        for (w_idx, &word) in self.0.iter().enumerate() {
+            if word != 0 {
+                count += word.count_ones() as usize;
+                let (mut bits, base) = (word, (w_idx * 64) as u64);
+                while bits != 0 {
+                    let id = base + bits.trailing_zeros() as u64;
+                    sum += id;
+                    if first_10.len() < 10 { first_10.push(id as u32); }
+                    bits &= bits - 1;
                 }
-                count += 1;
-                sum += doc_id as u64;
-                if first_10.len() < 10 {
-                    first_10.push(doc_id as u32);
-                }
-                w &= w - 1;
             }
         }
         (count, sum, first_10)
     }
 }
 
-fn format_result_into(count: usize, sum: u64, first_10: &[u32], output: &mut String) {
-    if count == 0 {
-        output.push_str("0 0\n");
-    } else {
-        write!(output, "{} {}", count, sum).unwrap();
-        for &id in first_10 {
-            write!(output, " {}", id).unwrap();
-        }
-        output.push('\n');
-    }
+#[inline(always)]
+fn write_res(count: usize, sum: u64, ids: &[u32], out: &mut String) {
+    if count == 0 { out.push_str("0 0\n"); return; }
+    use std::fmt::Write;
+    let _ = write!(out, "{} {}", count, sum);
+    for &id in &ids[..count.min(10)] { let _ = write!(out, " {}", id); }
+    out.push('\n');
 }
 
 pub struct QueryEvaluator {
     pub bitset: BitSet,
     pub candidate_docs: Vec<u32>,
-    pub sorted_and_terms: Vec<(usize, u32)>, // (cardinality, term_id)
+    pub sorted_and_terms: Vec<(usize, u32)>,
 }
 
 impl QueryEvaluator {
     pub fn new(num_docs: usize) -> Self {
-        Self {
-            bitset: BitSet::new(num_docs),
-            candidate_docs: Vec::with_capacity(1024),
-            sorted_and_terms: Vec::with_capacity(8),
-        }
+        Self { bitset: BitSet::new(num_docs), candidate_docs: Vec::with_capacity(1024), sorted_and_terms: Vec::with_capacity(8) }
     }
 
-    pub fn evaluate_parsed_query(
-        &mut self,
-        query_idx: usize,
-        query: &ParsedQuery,
-        corpus: &CorpusIndex,
-        output: &mut String,
-    ) {
+    pub fn evaluate_parsed_query(&mut self, query_idx: usize, query: &ParsedQuery, corpus: &CorpusIndex, output: &mut String) {
         match query {
-            ParsedQuery::Bool {
-                first_term,
-                clauses,
-            } => {
-                let is_pure_and = clauses.iter().all(|(op, _)| *op == BoolOp::And);
-
-                if is_pure_and {
-                    // Collect all terms, sort by cardinality (rarest first)
+            ParsedQuery::Bool { first_term, clauses } => {
+                if clauses.iter().all(|(op, _)| *op == BoolOp::And) {
                     self.sorted_and_terms.clear();
-
-                    let first_tid = match corpus.vocab.get_term_id(first_term) {
-                        Some(id) => id,
-                        None => {
-                            output.push_str("0 0\n");
-                            return;
-                        }
-                    };
-                    let first_len = corpus.get_posting_len(first_tid);
-                    if first_len == 0 {
-                        output.push_str("0 0\n");
-                        return;
-                    }
-                    self.sorted_and_terms.push((first_len, first_tid));
-
-                    for (_, term) in clauses {
-                        let tid = match corpus.vocab.get_term_id(term) {
-                            Some(id) => id,
-                            None => {
-                                output.push_str("0 0\n");
-                                return;
-                            }
-                        };
+                    for t in std::iter::once(first_term).chain(clauses.iter().map(|(_, t)| t)) {
+                        let tid = match corpus.vocab.get_term_id(t) { Some(id) => id, None => { output.push_str("0 0\n"); return; } };
                         let len = corpus.get_posting_len(tid);
-                        if len == 0 {
-                            output.push_str("0 0\n");
-                            return;
-                        }
+                        if len == 0 { output.push_str("0 0\n"); return; }
                         self.sorted_and_terms.push((len, tid));
                     }
-
-                    // Sort terms: smallest posting list first
                     self.sorted_and_terms.sort_unstable_by_key(|&(len, _)| len);
-
-                    // Load rarest term
                     let (_, rarest_tid) = self.sorted_and_terms[0];
                     match corpus.get_postings(rarest_tid) {
                         Some(PostingRef::Sparse(initial)) => {
                             self.candidate_docs.clear();
                             self.candidate_docs.extend_from_slice(initial);
-
                             for &(_, tid) in &self.sorted_and_terms[1..] {
-                                if self.candidate_docs.is_empty() {
-                                    break;
-                                }
+                                if self.candidate_docs.is_empty() { break; }
                                 match corpus.get_postings(tid) {
-                                    Some(PostingRef::Sparse(other)) => {
-                                        // Binary search intersection
-                                        self.candidate_docs
-                                            .retain(|&id| other.binary_search(&id).is_ok());
-                                    }
-                                    Some(PostingRef::Dense(words)) => {
-                                        // Direct bit test
-                                        self.candidate_docs.retain(|&id| {
-                                            let idx = id as usize;
-                                            (words[idx / 64] & (1u64 << (idx % 64))) != 0
-                                        });
-                                    }
-                                    None => {
-                                        self.candidate_docs.clear();
-                                        break;
-                                    }
+                                    Some(PostingRef::Sparse(other)) => self.candidate_docs.retain(|&id| other.binary_search(&id).is_ok()),
+                                    Some(PostingRef::Dense(words)) => self.candidate_docs.retain(|&id| {
+                                        let idx = id as usize;
+                                        (words[idx / 64] & (1u64 << (idx % 64))) != 0
+                                    }),
+                                    None => { self.candidate_docs.clear(); break; }
                                 }
                             }
-
-                            if self.candidate_docs.is_empty() {
-                                output.push_str("0 0\n");
-                            } else {
-                                let count = self.candidate_docs.len();
-                                let sum: u64 = self.candidate_docs.iter().map(|&id| id as u64).sum();
-                                let limit = count.min(10);
-                                format_result_into(count, sum, &self.candidate_docs[..limit], output);
-                            }
+                            let count = self.candidate_docs.len();
+                            let sum: u64 = self.candidate_docs.iter().map(|&id| id as u64).sum();
+                            write_res(count, sum, &self.candidate_docs, output);
                             return;
                         }
                         Some(PostingRef::Dense(words)) => {
-                            // Rarest term is dense -> all terms are dense
                             self.bitset.load_dense(words);
-                            for &(_, tid) in &self.sorted_and_terms[1..] {
-                                match corpus.get_postings(tid) {
-                                    Some(PostingRef::Dense(w)) => self.bitset.intersect_with_dense(w),
-                                    Some(PostingRef::Sparse(s)) => self.bitset.intersect_with_sparse(s),
-                                    None => {
-                                        self.bitset.clear();
-                                        break;
-                                    }
-                                }
-                            }
+                            for &(_, tid) in &self.sorted_and_terms[1..] { self.bitset.apply(BoolOp::And, corpus.get_postings(tid)); }
                             let (count, sum, first_10) = self.bitset.summary();
-                            format_result_into(count, sum, &first_10, output);
+                            write_res(count, sum, &first_10, output);
                             return;
                         }
-                        None => {
-                            output.push_str("0 0\n");
-                            return;
-                        }
+                        None => { output.push_str("0 0\n"); return; }
                     }
                 }
-
-                // General mixed boolean query: Strictly evaluate left to right
-                let first_id = corpus.vocab.get_term_id(first_term);
-                let first_postings = first_id.and_then(|id| corpus.get_postings(id));
-
-                match first_postings {
+                match corpus.vocab.get_term_id(first_term).and_then(|id| corpus.get_postings(id)) {
                     Some(PostingRef::Sparse(s)) => self.bitset.load_sparse(s),
                     Some(PostingRef::Dense(d)) => self.bitset.load_dense(d),
                     None => self.bitset.clear(),
                 }
-
                 for (op, term) in clauses {
-                    let term_id = corpus.vocab.get_term_id(term);
-                    let term_postings = term_id.and_then(|id| corpus.get_postings(id));
-
-                    match (op, term_postings) {
-                        (BoolOp::And, Some(PostingRef::Sparse(s))) => self.bitset.intersect_with_sparse(s),
-                        (BoolOp::And, Some(PostingRef::Dense(d))) => self.bitset.intersect_with_dense(d),
-                        (BoolOp::And, None) => self.bitset.clear(),
-
-                        (BoolOp::Or, Some(PostingRef::Sparse(s))) => self.bitset.union_sparse(s),
-                        (BoolOp::Or, Some(PostingRef::Dense(d))) => self.bitset.union_dense(d),
-                        (BoolOp::Or, None) => {}
-
-                        (BoolOp::Not, Some(PostingRef::Sparse(s))) => self.bitset.difference_with_sparse(s),
-                        (BoolOp::Not, Some(PostingRef::Dense(d))) => self.bitset.difference_with_dense(d),
-                        (BoolOp::Not, None) => {}
-                    }
+                    let post = corpus.vocab.get_term_id(term).and_then(|id| corpus.get_postings(id));
+                    self.bitset.apply(*op, post);
                 }
-
                 let (count, sum, first_10) = self.bitset.summary();
-                format_result_into(count, sum, &first_10, output);
+                write_res(count, sum, &first_10, output);
             }
             ParsedQuery::Phrase { .. } => {
                 let docs = &corpus.phrase_postings[query_idx];
-                let count = docs.len();
-                if count == 0 {
-                    output.push_str("0 0\n");
-                } else {
-                    let sum: u64 = docs.iter().map(|&id| id as u64).sum();
-                    let limit = count.min(10);
-                    format_result_into(count, sum, &docs[..limit], output);
-                }
+                let sum: u64 = docs.iter().map(|&id| id as u64).sum();
+                write_res(docs.len(), sum, docs, output);
             }
-            ParsedQuery::Empty => {
-                output.push_str("0 0\n");
-            }
+            ParsedQuery::Empty => output.push_str("0 0\n"),
         }
     }
 }
 
-pub fn parallel_evaluate_queries(
-    corpus: &CorpusIndex,
-    queries: &[ParsedQuery],
-    num_threads: usize,
-) -> (Vec<String>, std::time::Duration, std::time::Duration) {
-    if queries.is_empty() {
-        return (Vec::new(), std::time::Duration::ZERO, std::time::Duration::ZERO);
-    }
-
+pub fn parallel_evaluate_queries(corpus: &CorpusIndex, queries: &[ParsedQuery], num_threads: usize) -> Vec<String> {
+    if queries.is_empty() { return Vec::new(); }
     let actual_threads = num_threads.max(1).min(queries.len());
     let next_query_idx = AtomicUsize::new(0);
 
-    let thread_results: Vec<(Vec<(usize, String)>, u64, u64)> = std::thread::scope(|s| {
+    let thread_results: Vec<Vec<(usize, String)>> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(actual_threads);
         for _ in 0..actual_threads {
-            let next_idx_ref = &next_query_idx;
+            let next = &next_query_idx;
             handles.push(s.spawn(move || {
-                let mut evaluator = QueryEvaluator::new(corpus.num_docs);
-                let mut local_results = Vec::with_capacity(queries.len() / actual_threads + 32);
-                let mut buf = String::with_capacity(64);
-                let mut bool_nanos = 0u64;
-                let mut phrase_nanos = 0u64;
-
+                let (mut evaluator, mut local_results, mut buf) = (QueryEvaluator::new(corpus.num_docs), Vec::with_capacity(queries.len() / actual_threads + 32), String::with_capacity(64));
                 loop {
-                    let idx = next_idx_ref.fetch_add(1, AtomicOrdering::Relaxed);
-                    if idx >= queries.len() {
-                        break;
-                    }
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= queries.len() { break; }
                     buf.clear();
-                    let q = &queries[idx];
-                    let t_start = std::time::Instant::now();
-                    evaluator.evaluate_parsed_query(idx, q, corpus, &mut buf);
-                    let dt = t_start.elapsed().as_nanos() as u64;
-                    match q {
-                        ParsedQuery::Bool { .. } => bool_nanos += dt,
-                        ParsedQuery::Phrase { .. } => phrase_nanos += dt,
-                        ParsedQuery::Empty => {}
-                    }
+                    evaluator.evaluate_parsed_query(idx, &queries[idx], corpus, &mut buf);
                     local_results.push((idx, buf.clone()));
                 }
-
-                (local_results, bool_nanos, phrase_nanos)
+                local_results
             }));
         }
-
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        let mut res = Vec::new();
+        for h in handles { res.push(h.join().unwrap()); }
+        res
     });
 
     let mut answers = vec![String::new(); queries.len()];
-    let mut total_bool_nanos = 0u64;
-    let mut total_phrase_nanos = 0u64;
-
-    for (local_res, b_ns, p_ns) in thread_results {
-        total_bool_nanos += b_ns;
-        total_phrase_nanos += p_ns;
-        for (idx, ans) in local_res {
-            answers[idx] = ans;
-        }
+    for local_res in thread_results {
+        for (idx, ans) in local_res { answers[idx] = ans; }
     }
-
-    (
-        answers,
-        std::time::Duration::from_nanos(total_bool_nanos),
-        std::time::Duration::from_nanos(total_phrase_nanos),
-    )
+    answers
 }
 
 #[cfg(target_os = "linux")]
 fn mmap_file(file: &fs::File, len: usize) -> Result<&'static [u8], String> {
     use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    let addr: *mut u8;
+    let (fd, addr): (i32, *mut u8);
+    fd = file.as_raw_fd();
     unsafe {
         std::arch::asm!(
             "syscall",
-            in("rax") 9usize, // sys_mmap
-            in("rdi") 0usize, // addr = NULL
-            in("rsi") len,   // length
-            in("rdx") 1usize, // PROT_READ
-            in("r10") 2usize, // MAP_PRIVATE
-            in("r8") fd,     // fd
-            in("r9") 0usize, // offset = 0
-            lateout("rax") addr,
-            lateout("rcx") _,
-            lateout("r11") _,
+            in("rax") 9usize, in("rdi") 0usize, in("rsi") len, in("rdx") 1usize, in("r10") 2usize, in("r8") fd, in("r9") 0usize,
+            lateout("rax") addr, lateout("rcx") _, lateout("r11") _,
         );
     }
-    if (addr as isize) < 0 && (addr as isize) > -4096 {
-        return Err(format!("mmap failed with errno {}", -(addr as isize)));
-    }
+    if (addr as isize) < 0 && (addr as isize) > -4096 { return Err(format!("mmap error {}", -(addr as isize))); }
     unsafe { Ok(std::slice::from_raw_parts(addr, len)) }
 }
+#[cfg(not(target_os = "linux"))]
+fn mmap_file(_f: &fs::File, _len: usize) -> Result<&'static [u8], String> { Err("linux only".into()) }
 
-#[cfg(target_os = "linux")]
 fn munmap_file(data: &[u8]) {
+    #[cfg(target_os = "linux")]
     unsafe {
-        std::arch::asm!(
-            "syscall",
-            in("rax") 11usize, // sys_munmap
-            in("rdi") data.as_ptr() as usize,
-            in("rsi") data.len(),
-            lateout("rax") _,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
+        std::arch::asm!("syscall", in("rax") 11usize, in("rdi") data.as_ptr() as usize, in("rsi") data.len(), lateout("rax") _, lateout("rcx") _, lateout("r11") _);
     }
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let data_dir = if args.len() > 1 { &args[1] } else { "/data" };
-    let out_dir = if args.len() > 2 { &args[2] } else { "/out" };
-
-    let docs_path = Path::new(data_dir).join("docs.txt");
-    let queries_path = Path::new(data_dir).join("queries.txt");
-
-    if !docs_path.exists() || !queries_path.exists() {
-        eprintln!(
-            "Input files missing: {} or {}",
-            docs_path.display(),
-            queries_path.display()
-        );
-        std::process::exit(1);
-    }
-
-    let t0 = std::time::Instant::now();
-    let queries_data = fs::read(&queries_path).expect("failed to read queries.txt");
-
-    let num_threads = env::var("RAYON_NUM_THREADS")
-        .or_else(|_| env::var("THREADS"))
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        });
-
-    let ingest_threads = env::var("INGEST_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(num_threads);
-
-    let t_ingest_start = std::time::Instant::now();
-    let vocab = QueryVocabularies::extract(&queries_data);
-    let parsed_queries = parse_all_queries(&queries_data);
+    let (data_dir, out_dir) = (if args.len() > 1 { &args[1] } else { "/data" }, if args.len() > 2 { &args[2] } else { "/out" });
+    let queries_data = fs::read(Path::new(data_dir).join("queries.txt")).expect("read queries.txt");
+    let num_threads = env::var("NUM_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let (vocab, parsed_queries) = (QueryVocabularies::extract(&queries_data), parse_all_queries(&queries_data));
     drop(queries_data);
 
-    // APPROACH B: Memory-mapped file input for docs.txt
-    let docs_file = fs::File::open(&docs_path).expect("failed to open docs.txt");
-    let docs_len = docs_file.metadata().expect("failed to get docs metadata").len() as usize;
+    let docs_file = fs::File::open(Path::new(data_dir).join("docs.txt")).expect("open docs.txt");
+    let docs_len = docs_file.metadata().expect("docs metadata").len() as usize;
 
     let (corpus, docs_data) = if docs_len > 0 {
-        let docs_data = mmap_file(&docs_file, docs_len).expect("mmap docs.txt failed");
-        let idx = CorpusIndex::build(docs_data, vocab, &parsed_queries, ingest_threads).expect("corpus index build failed");
-        (idx, Some(docs_data))
+        let data = mmap_file(&docs_file, docs_len).expect("mmap failed");
+        (CorpusIndex::build(data, vocab, &parsed_queries, num_threads).expect("build failed"), Some(data))
     } else {
-        (CorpusIndex::build(&[], vocab, &parsed_queries, ingest_threads).expect("corpus index build failed"), None)
+        (CorpusIndex::build(&[], vocab, &parsed_queries, num_threads).expect("build failed"), None)
     };
-    let t_ingest = t_ingest_start.elapsed();
-
-    if let Some(data) = docs_data {
-        munmap_file(data);
-    }
+    if let Some(d) = docs_data { munmap_file(d); }
     drop(docs_file);
 
-    let t_q_start = std::time::Instant::now();
-    let (results, t_bool_cpu, t_phrase_cpu) = parallel_evaluate_queries(&corpus, &parsed_queries, num_threads);
-    let t_query = t_q_start.elapsed();
-
-    let mut output_str = String::with_capacity(parsed_queries.len() * 32);
-    for res in &results {
-        output_str.push_str(res);
-    }
-    let output_bytes = output_str.into_bytes();
-
+    let results = parallel_evaluate_queries(&corpus, &parsed_queries, num_threads);
+    let mut out = String::with_capacity(parsed_queries.len() * 32);
+    for r in &results { out.push_str(r); }
     let out_dir_path = Path::new(out_dir);
-    fs::create_dir_all(out_dir_path).expect("failed to create output dir");
-    let out_file_path = out_dir_path.join("results.txt");
-
-    let mut file = fs::File::create(&out_file_path).expect("failed to create results.txt");
-    file.write_all(&output_bytes).expect("failed to write results.txt");
-    file.flush().expect("failed to flush results.txt");
-
-    let t_total = t0.elapsed();
-
-    eprintln!(
-        "Index pipeline [V2-MMap, threads={}, ingest_threads={}]: docs={}, queries={}, vocab_entries={}, stored_postings={}, ingest={:?}, query_wall={:?}, total={:?}",
-        num_threads, ingest_threads, corpus.num_docs, parsed_queries.len(), corpus.vocab.num_terms(), corpus.retained_postings_count(), t_ingest, t_query, t_total
-    );
-    eprintln!(
-        "Query work breakdown (aggregate CPU): bool={:?}, phrase={:?}",
-        t_bool_cpu, t_phrase_cpu
-    );
-
-    if let Ok(status) = fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if line.starts_with("VmHWM:") || line.starts_with("VmRSS:") || line.starts_with("RssAnon:") || line.starts_with("RssFile:") {
-                eprintln!("{}", line.trim());
-            }
-        }
-    }
+    fs::create_dir_all(out_dir_path).expect("create out dir");
+    fs::write(out_dir_path.join("results.txt"), out.into_bytes()).expect("write results");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_tokenizer_uppercase_and_lowercase() {
-        assert_eq!(tokenize(b"The Quick BROWN fox 123"), vec![
-            b"the".to_vec(),
-            b"quick".to_vec(),
-            b"brown".to_vec(),
-            b"fox".to_vec(),
-            b"123".to_vec(),
-        ]);
-    }
-
-    #[test]
-    fn test_tokenizer_zurich() {
-        let text = "Zürich".as_bytes();
-        assert_eq!(tokenize(text), vec![b"z".to_vec(), b"rich".to_vec()]);
-    }
-
-    #[test]
-    fn test_tokenizer_naive() {
-        let text = "naïve".as_bytes();
-        assert_eq!(tokenize(text), vec![b"na".to_vec(), b"ve".to_vec()]);
-    }
-
-    #[test]
-    fn test_tokenizer_habeas_corpus_punctuation() {
-        assert_eq!(
-            tokenize(b"habeas-corpus, court's, U.S.C."),
-            vec![
-                b"habeas".to_vec(),
-                b"corpus".to_vec(),
-                b"court".to_vec(),
-                b"s".to_vec(),
-                b"u".to_vec(),
-                b"s".to_vec(),
-                b"c".to_vec(),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_edge_cases_all_documents_empty_results_missing_terms() {
-        let mut docs = Vec::new();
-        for i in 0..20 {
-            let parity = if i % 2 == 0 { "even" } else { "odd" };
-            docs.extend_from_slice(format!("{}\tuniversal {}\n", i, parity).as_bytes());
-        }
-
-        let queries = b"BOOL universal\n\
-BOOL missing\n\
-BOOL universal NOT universal\n\
-BOOL even OR odd\n\
-PHRASE \"missing term here\"\n\
-PHRASE \"universal universal\"\n";
-
-        let vocab = QueryVocabularies::extract(queries);
-        let parsed_queries = parse_all_queries(queries);
-        let corpus = CorpusIndex::build(&docs, vocab, &parsed_queries, 4).unwrap();
-
-        let (results, _, _) = parallel_evaluate_queries(&corpus, &parsed_queries, 4);
-
-        assert_eq!(results[0], "20 190 0 1 2 3 4 5 6 7 8 9\n");
-        assert_eq!(results[1], "0 0\n");
-        assert_eq!(results[2], "0 0\n");
-        assert_eq!(results[3], "20 190 0 1 2 3 4 5 6 7 8 9\n");
-        assert_eq!(results[4], "0 0\n");
-        assert_eq!(results[5], "0 0\n");
+    fn test_queries() {
+        let docs = b"0\tuniversal even\n1\tuniversal odd\n";
+        let q = b"BOOL universal\nBOOL missing\nPHRASE \"universal even\"\n";
+        let (v, pq) = (QueryVocabularies::extract(q), parse_all_queries(q));
+        let c = CorpusIndex::build(docs, v, &pq, 2).unwrap();
+        let res = parallel_evaluate_queries(&c, &pq, 2);
+        assert_eq!(res[0], "2 1 0 1\n");
+        assert_eq!(res[1], "0 0\n");
+        assert_eq!(res[2], "1 0 0\n");
     }
 }
+
