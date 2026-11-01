@@ -113,7 +113,63 @@ pub fn tokenize(text: &[u8]) -> Vec<Vec<u8>> {
 
 pub const SENTINEL_TOKEN_ID: u16 = 0xFFFF;
 
+const BLOOM_WORDS: usize = 16384;
+const BLOOM_MASK: usize = (BLOOM_WORDS * 64) - 1;
+
+pub struct FastBloom {
+    pub bits: Box<[u64; BLOOM_WORDS]>,
+}
+
+impl FastBloom {
+    pub fn new() -> Self {
+        Self {
+            bits: vec![0u64; BLOOM_WORDS].into_boxed_slice().try_into().unwrap(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn insert(&mut self, h: u64) {
+        let b1 = (h as usize) & BLOOM_MASK;
+        let b2 = ((h >> 20) as usize) & BLOOM_MASK;
+        let b3 = ((h >> 40) as usize) & BLOOM_MASK;
+        self.bits[b1 / 64] |= 1u64 << (b1 % 64);
+        self.bits[b2 / 64] |= 1u64 << (b2 % 64);
+        self.bits[b3 / 64] |= 1u64 << (b3 % 64);
+    }
+
+    #[inline(always)]
+    pub fn might_contain(&self, h: u64) -> bool {
+        let b1 = (h as usize) & BLOOM_MASK;
+        let b2 = ((h >> 20) as usize) & BLOOM_MASK;
+        let b3 = ((h >> 40) as usize) & BLOOM_MASK;
+        ((self.bits[b1 / 64] & (1u64 << (b1 % 64))) != 0)
+            && ((self.bits[b2 / 64] & (1u64 << (b2 % 64))) != 0)
+            && ((self.bits[b3 / 64] & (1u64 << (b3 % 64))) != 0)
+    }
+}
+
+#[inline(always)]
+pub fn hash_token(mut bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517cc1b727220a95;
+    let mut hash = 0u64;
+    while bytes.len() >= 8 {
+        let word = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
+        bytes = &bytes[8..];
+    }
+    if bytes.len() >= 4 {
+        let word = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64;
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
+        bytes = &bytes[4..];
+    }
+    for &b in bytes {
+        hash = (hash.rotate_left(5) ^ (b as u64)).wrapping_mul(K);
+    }
+    hash
+}
+
 pub struct QueryVocabularies {
+    pub bloom: FastBloom,
     pub all_terms_map: FastHashMap<Vec<u8>, u32>,
     pub phrase_terms_map: FastHashMap<Vec<u8>, u16>,
     pub term_to_phrase_id: Vec<u16>,
@@ -169,24 +225,31 @@ impl QueryVocabularies {
         let mut all_terms_map = FastHashMap::with_capacity_and_hasher(sorted_all.len(), FastBuildHasher::default());
         let mut term_to_phrase_id = Vec::with_capacity(sorted_all.len());
 
+        let mut bloom = FastBloom::new();
         for (id, tok) in sorted_all.into_iter().enumerate() {
             let pid = phrase_terms_map
                 .get(&tok)
                 .copied()
                 .unwrap_or(SENTINEL_TOKEN_ID);
+            bloom.insert(hash_token(&tok));
             all_terms_map.insert(tok, id as u32);
             term_to_phrase_id.push(pid);
         }
 
         Self {
+            bloom,
             all_terms_map,
             phrase_terms_map,
             term_to_phrase_id,
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn get_term_id(&self, tok: &[u8]) -> Option<u32> {
+        let h = hash_token(tok);
+        if !self.bloom.might_contain(h) {
+            return None;
+        }
         self.all_terms_map.get(tok).copied()
     }
 
@@ -201,24 +264,273 @@ impl QueryVocabularies {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoolOp {
+    And,
+    Or,
+    Not,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParsedQuery {
+    Bool {
+        first_term: Vec<u8>,
+        clauses: Vec<(BoolOp, Vec<u8>)>,
+    },
+    Phrase {
+        terms: Vec<Vec<u8>>,
+    },
+    Empty,
+}
+
+pub fn parse_query_line(line: &[u8]) -> ParsedQuery {
+    let line = if line.ends_with(b"\r") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    if line.is_empty() {
+        return ParsedQuery::Empty;
+    }
+    if line.starts_with(b"BOOL ") {
+        let rest = &line[5..];
+        let mut parts = rest.split(|&b| b == b' ');
+        let first_term = match parts.next() {
+            Some(t) if !t.is_empty() => t.to_vec(),
+            _ => return ParsedQuery::Empty,
+        };
+        let mut clauses = Vec::new();
+        while let Some(op_bytes) = parts.next() {
+            if op_bytes.is_empty() {
+                continue;
+            }
+            let op = if op_bytes == b"AND" {
+                BoolOp::And
+            } else if op_bytes == b"OR" {
+                BoolOp::Or
+            } else if op_bytes == b"NOT" {
+                BoolOp::Not
+            } else {
+                continue;
+            };
+            if let Some(term) = parts.next() {
+                if !term.is_empty() {
+                    clauses.push((op, term.to_vec()));
+                }
+            }
+        }
+        ParsedQuery::Bool {
+            first_term,
+            clauses,
+        }
+    } else if line.starts_with(b"PHRASE \"") && line.ends_with(b"\"") && line.len() >= 9 {
+        let inner = &line[8..line.len() - 1];
+        let terms: Vec<Vec<u8>> = inner
+            .split(|&b| b == b' ')
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_vec())
+            .collect();
+        if terms.is_empty() {
+            ParsedQuery::Empty
+        } else {
+            ParsedQuery::Phrase { terms }
+        }
+    } else {
+        ParsedQuery::Empty
+    }
+}
+
+pub fn parse_all_queries(queries_data: &[u8]) -> Vec<ParsedQuery> {
+    let mut queries = Vec::new();
+    for line in queries_data.split(|&b| b == b'\n') {
+        let line = if line.ends_with(b"\r") {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+        if line.is_empty() {
+            continue;
+        }
+        queries.push(parse_query_line(line));
+    }
+    queries
+}
+
+
+
+#[derive(Clone, Copy, Default)]
+pub struct TrieNode {
+    pub edges_start: u32,
+    pub edges_len: u16,
+    pub match_start: u32,
+    pub match_len: u16,
+}
+
+#[derive(Clone, Copy)]
+pub struct TrieEdge {
+    pub pid: u16,
+    pub next_node: u32,
+}
+
+pub struct PhraseTrie {
+    pub root_transitions: Vec<u32>,
+    pub nodes: Vec<TrieNode>,
+    pub edges: Vec<TrieEdge>,
+    pub matches: Vec<u32>,
+}
+
+impl PhraseTrie {
+    pub fn build(vocab: &QueryVocabularies, queries: &[ParsedQuery]) -> Self {
+        let mut temp_edges: Vec<FastHashMap<u16, u32>> = vec![FastHashMap::default()];
+        let mut temp_matches: Vec<Vec<u32>> = vec![Vec::new()];
+
+        for (q_idx, query) in queries.iter().enumerate() {
+            if let ParsedQuery::Phrase { terms } = query {
+                let mut pids = Vec::with_capacity(terms.len());
+                let mut valid = true;
+                for t in terms {
+                    if let Some(pid) = vocab.get_phrase_id(t) {
+                        pids.push(pid);
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if !valid || pids.is_empty() {
+                    continue;
+                }
+                let mut curr = 0usize;
+                for &pid in &pids {
+                    let next_idx = match temp_edges[curr].get(&pid) {
+                        Some(&nxt) => nxt as usize,
+                        None => {
+                            let nxt = temp_edges.len();
+                            temp_edges.push(FastHashMap::default());
+                            temp_matches.push(Vec::new());
+                            temp_edges[curr].insert(pid, nxt as u32);
+                            nxt
+                        }
+                    };
+                    curr = next_idx;
+                }
+                temp_matches[curr].push(q_idx as u32);
+            }
+        }
+
+        let num_phrase_terms = vocab.phrase_terms_map.len();
+        let mut root_transitions = vec![0u32; num_phrase_terms];
+        for (&pid, &nxt) in &temp_edges[0] {
+            if (pid as usize) < num_phrase_terms {
+                root_transitions[pid as usize] = nxt;
+            }
+        }
+
+        let mut nodes = Vec::with_capacity(temp_edges.len());
+        let mut edges = Vec::new();
+        let mut matches = Vec::new();
+
+        for i in 0..temp_edges.len() {
+            let edges_start = edges.len() as u32;
+            let mut node_edges: Vec<TrieEdge> = temp_edges[i]
+                .iter()
+                .map(|(&pid, &next_node)| TrieEdge { pid, next_node })
+                .collect();
+            node_edges.sort_unstable_by_key(|e| e.pid);
+            let edges_len = node_edges.len() as u16;
+            edges.extend_from_slice(&node_edges);
+
+            let match_start = matches.len() as u32;
+            let match_len = temp_matches[i].len() as u16;
+            matches.extend_from_slice(&temp_matches[i]);
+
+            nodes.push(TrieNode {
+                edges_start,
+                edges_len,
+                match_start,
+                match_len,
+            });
+        }
+
+        Self {
+            root_transitions,
+            nodes,
+            edges,
+            matches,
+        }
+    }
+
+    #[inline(always)]
+    pub fn root_transition(&self, pid: u16) -> u32 {
+        let idx = pid as usize;
+        if idx < self.root_transitions.len() {
+            unsafe { *self.root_transitions.get_unchecked(idx) }
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub fn transition(&self, node_idx: u32, pid: u16) -> u32 {
+        let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
+        if node.edges_len == 1 {
+            let edge = unsafe { *self.edges.get_unchecked(node.edges_start as usize) };
+            if edge.pid == pid {
+                return edge.next_node;
+            }
+            return 0;
+        }
+        if node.edges_len > 1 {
+            let start = node.edges_start as usize;
+            let end = start + node.edges_len as usize;
+            let slice = unsafe { self.edges.get_unchecked(start..end) };
+            if let Ok(idx) = slice.binary_search_by_key(&pid, |e| e.pid) {
+                return unsafe { slice.get_unchecked(idx).next_node };
+            }
+        }
+        0
+    }
+
+    #[inline(always)]
+    pub fn record_matches(
+        &self,
+        node_idx: u32,
+        doc_id: u32,
+        last_doc: &mut [u32],
+        thread_matches: &mut Vec<(u32, u32)>,
+    ) {
+        let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
+        if node.match_len > 0 {
+            let start = node.match_start as usize;
+            let end = start + node.match_len as usize;
+            let q_indices = unsafe { self.matches.get_unchecked(start..end) };
+            for &q_idx in q_indices {
+                let q = q_idx as usize;
+                if unsafe { *last_doc.get_unchecked(q) != doc_id } {
+                    unsafe { *last_doc.get_unchecked_mut(q) = doc_id; }
+                    thread_matches.push((q_idx, doc_id));
+                }
+            }
+        }
+    }
+}
+
 pub enum PostingRef<'a> {
     Sparse(&'a [u32]),
     Dense(&'a [u64]),
 }
 
-pub struct CorpusIndex<'a> {
+pub struct CorpusIndex {
     pub num_docs: usize,
-    pub docs_data: &'a [u8],
-    pub doc_line_offsets: Vec<u32>,
     pub postings_offsets: Vec<u32>,
     pub postings_data: Vec<u32>,
     pub dense_bitsets: Vec<u64>,
     pub dense_term_map: Vec<Option<u32>>,
     pub words_per_bitset: usize,
     pub vocab: QueryVocabularies,
+    pub phrase_postings: Vec<Vec<u32>>,
 }
 
-impl<'a> CorpusIndex<'a> {
+impl CorpusIndex {
     #[inline]
     pub fn get_postings(&self, term_id: u32) -> Option<PostingRef<'_>> {
         let id = term_id as usize;
@@ -272,7 +584,7 @@ impl<'a> CorpusIndex<'a> {
         self.postings_data.len()
     }
 
-    pub fn build(docs_data: &'a [u8], vocab: QueryVocabularies, num_threads: usize) -> Result<Self, String> {
+    pub fn build(docs_data: &[u8], vocab: QueryVocabularies, queries: &[ParsedQuery], num_threads: usize) -> Result<Self, String> {
         let actual_workers = num_threads.max(1);
         let chunks = partition_docs_data(docs_data, actual_workers);
         let num_terms = vocab.num_terms();
@@ -281,20 +593,17 @@ impl<'a> CorpusIndex<'a> {
             first_doc_id: usize,
             num_docs: usize,
             term_counts: Vec<u32>,
-            doc_line_offsets: Vec<u32>,
         }
 
         let pass1_results: Result<Vec<Pass1Result>, String> = std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
                 let vocab_ref = &vocab;
-                let chunk_base_offset = (chunk.as_ptr() as usize).saturating_sub(docs_data.as_ptr() as usize);
-                handles.push(s.spawn(move || {
+                                handles.push(s.spawn(move || {
                     let mut term_counts = vec![0u32; num_terms];
                     let mut seen_epoch = vec![0u32; num_terms];
                     let mut current_epoch = 1u32;
                     let mut scratch = Vec::with_capacity(32);
-                    let mut doc_line_offsets = Vec::with_capacity(32768);
 
                     let mut pos = 0;
                     let mut first_doc_id = 0;
@@ -339,9 +648,6 @@ impl<'a> CorpusIndex<'a> {
                             }
                         }
 
-                        let global_line_start = (chunk_base_offset + line_start) as u32;
-                        doc_line_offsets.push(global_line_start);
-
                         let text = &line[tab_pos + 1..];
                         current_epoch += 1;
                         if current_epoch == u32::MAX {
@@ -366,7 +672,6 @@ impl<'a> CorpusIndex<'a> {
                         first_doc_id,
                         num_docs,
                         term_counts,
-                        doc_line_offsets,
                     })
                 }));
             }
@@ -382,10 +687,8 @@ impl<'a> CorpusIndex<'a> {
 
         let mut total_docs = 0;
         let mut expected_doc = 0;
-        let mut all_doc_offsets = Vec::with_capacity(250000);
 
         for r in &pass1_results {
-            all_doc_offsets.extend_from_slice(&r.doc_line_offsets);
             if r.num_docs > 0 {
                 if r.first_doc_id != expected_doc {
                     return Err(format!("doc gap: expected {}, got {}", expected_doc, r.first_doc_id));
@@ -394,7 +697,6 @@ impl<'a> CorpusIndex<'a> {
                 total_docs += r.num_docs;
             }
         }
-        all_doc_offsets.push(docs_data.len() as u32);
 
         let mut total_term_counts = vec![0u32; num_terms];
         for r in &pass1_results {
@@ -425,18 +727,25 @@ impl<'a> CorpusIndex<'a> {
 
         let mut postings_data = vec![0u32; total_postings as usize];
 
-        // PASS 2: Fill postings memory directly
-        std::thread::scope(|s| {
+        let phrase_trie = PhraseTrie::build(&vocab, queries);
+
+        // PASS 2: Fill postings memory and track phrase occurrences
+        let thread_matches: Vec<Vec<(u32, u32)>> = std::thread::scope(|s| {
             let postings_ptr = postings_data.as_mut_ptr() as usize;
+            let mut handles = Vec::with_capacity(chunks.len());
 
             for (w_idx, chunk) in chunks.iter().enumerate() {
                 let vocab_ref = &vocab;
+                let trie_ref = &phrase_trie;
                 let mut local_postings_ptrs = std::mem::take(&mut worker_ptrs[w_idx]);
+                let num_q = queries.len();
 
-                s.spawn(move || {
+                handles.push(s.spawn(move || {
                     let postings_raw = postings_ptr as *mut u32;
                     let mut seen_in_doc = Vec::with_capacity(256);
                     let mut scratch = Vec::with_capacity(32);
+                    let mut last_doc = vec![u32::MAX; num_q];
+                    let mut local_matches = Vec::with_capacity(2048);
 
                     let mut pos = 0;
 
@@ -470,10 +779,44 @@ impl<'a> CorpusIndex<'a> {
 
                         let text = &line[tab_pos + 1..];
                         seen_in_doc.clear();
+                        let mut active = [0u32; 16];
+                        let mut active_len = 0;
 
                         for_each_token(text, &mut scratch, |tok| {
                             if let Some(tid) = vocab_ref.get_term_id(tok) {
                                 seen_in_doc.push(tid);
+                                let pid = unsafe { *vocab_ref.term_to_phrase_id.get_unchecked(tid as usize) };
+                                if pid != SENTINEL_TOKEN_ID {
+                                    let mut next_active = [0u32; 16];
+                                    let mut next_len = 0;
+
+                                    for i in 0..active_len {
+                                        let nxt = trie_ref.transition(active[i], pid);
+                                        if nxt != 0 {
+                                            if next_len < 16 {
+                                                next_active[next_len] = nxt;
+                                                next_len += 1;
+                                            }
+                                            trie_ref.record_matches(nxt, doc_id, &mut last_doc, &mut local_matches);
+                                        }
+                                    }
+
+                                    let root_nxt = trie_ref.root_transition(pid);
+                                    if root_nxt != 0 {
+                                        if next_len < 16 {
+                                            next_active[next_len] = root_nxt;
+                                            next_len += 1;
+                                        }
+                                        trie_ref.record_matches(root_nxt, doc_id, &mut last_doc, &mut local_matches);
+                                    }
+
+                                    active = next_active;
+                                    active_len = next_len;
+                                } else {
+                                    active_len = 0;
+                                }
+                            } else {
+                                active_len = 0;
                             }
                         });
 
@@ -489,9 +832,20 @@ impl<'a> CorpusIndex<'a> {
                             local_postings_ptrs[ptr_idx] += 1;
                         }
                     }
-                });
+
+                    local_matches
+                }));
             }
+
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+
+        let mut phrase_postings: Vec<Vec<u32>> = vec![Vec::new(); queries.len()];
+        for w_matches in thread_matches {
+            for (q_idx, doc_id) in w_matches {
+                phrase_postings[q_idx as usize].push(doc_id);
+            }
+        }
 
         let dense_threshold = (total_docs / 32).max(64);
         let mut dense_term_map = vec![None; num_terms];
@@ -523,14 +877,13 @@ impl<'a> CorpusIndex<'a> {
 
         Ok(Self {
             num_docs: total_docs,
-            docs_data,
-            doc_line_offsets: all_doc_offsets,
             postings_offsets,
             postings_data,
             dense_bitsets,
             dense_term_map,
             words_per_bitset,
             vocab,
+            phrase_postings,
         })
     }
 }
@@ -707,103 +1060,7 @@ fn format_result_into(count: usize, sum: u64, first_10: &[u32], output: &mut Str
 pub struct QueryEvaluator {
     pub bitset: BitSet,
     pub candidate_docs: Vec<u32>,
-    pub phrase_token_ids: Vec<u16>,
-    pub matching_docs: Vec<u32>,
     pub sorted_and_terms: Vec<(usize, u32)>, // (cardinality, term_id)
-    pub doc_phrase_tokens: Vec<u16>,
-    pub scratch: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BoolOp {
-    And,
-    Or,
-    Not,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ParsedQuery {
-    Bool {
-        first_term: Vec<u8>,
-        clauses: Vec<(BoolOp, Vec<u8>)>,
-    },
-    Phrase {
-        terms: Vec<Vec<u8>>,
-    },
-    Empty,
-}
-
-pub fn parse_query_line(line: &[u8]) -> ParsedQuery {
-    let line = if line.ends_with(b"\r") {
-        &line[..line.len() - 1]
-    } else {
-        line
-    };
-    if line.is_empty() {
-        return ParsedQuery::Empty;
-    }
-    if line.starts_with(b"BOOL ") {
-        let rest = &line[5..];
-        let mut parts = rest.split(|&b| b == b' ');
-        let first_term = match parts.next() {
-            Some(t) if !t.is_empty() => t.to_vec(),
-            _ => return ParsedQuery::Empty,
-        };
-        let mut clauses = Vec::new();
-        while let Some(op_bytes) = parts.next() {
-            if op_bytes.is_empty() {
-                continue;
-            }
-            let op = if op_bytes == b"AND" {
-                BoolOp::And
-            } else if op_bytes == b"OR" {
-                BoolOp::Or
-            } else if op_bytes == b"NOT" {
-                BoolOp::Not
-            } else {
-                continue;
-            };
-            if let Some(term) = parts.next() {
-                if !term.is_empty() {
-                    clauses.push((op, term.to_vec()));
-                }
-            }
-        }
-        ParsedQuery::Bool {
-            first_term,
-            clauses,
-        }
-    } else if line.starts_with(b"PHRASE \"") && line.ends_with(b"\"") && line.len() >= 9 {
-        let inner = &line[8..line.len() - 1];
-        let terms: Vec<Vec<u8>> = inner
-            .split(|&b| b == b' ')
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_vec())
-            .collect();
-        if terms.is_empty() {
-            ParsedQuery::Empty
-        } else {
-            ParsedQuery::Phrase { terms }
-        }
-    } else {
-        ParsedQuery::Empty
-    }
-}
-
-pub fn parse_all_queries(queries_data: &[u8]) -> Vec<ParsedQuery> {
-    let mut queries = Vec::new();
-    for line in queries_data.split(|&b| b == b'\n') {
-        let line = if line.ends_with(b"\r") {
-            &line[..line.len() - 1]
-        } else {
-            line
-        };
-        if line.is_empty() {
-            continue;
-        }
-        queries.push(parse_query_line(line));
-    }
-    queries
 }
 
 impl QueryEvaluator {
@@ -811,16 +1068,13 @@ impl QueryEvaluator {
         Self {
             bitset: BitSet::new(num_docs),
             candidate_docs: Vec::with_capacity(1024),
-            phrase_token_ids: Vec::with_capacity(16),
-            matching_docs: Vec::with_capacity(1024),
             sorted_and_terms: Vec::with_capacity(8),
-            doc_phrase_tokens: Vec::with_capacity(512),
-            scratch: Vec::with_capacity(64),
         }
     }
 
     pub fn evaluate_parsed_query(
         &mut self,
+        query_idx: usize,
         query: &ParsedQuery,
         corpus: &CorpusIndex,
         output: &mut String,
@@ -966,124 +1220,15 @@ impl QueryEvaluator {
                 let (count, sum, first_10) = self.bitset.summary();
                 format_result_into(count, sum, &first_10, output);
             }
-            ParsedQuery::Phrase { terms } => {
-                self.phrase_token_ids.clear();
-                self.candidate_docs.clear();
-                self.matching_docs.clear();
-
-                if terms.is_empty() {
-                    output.push_str("0 0\n");
-                    return;
-                }
-
-                let mut rarest_tid = None;
-                let mut min_len = usize::MAX;
-
-                for t in terms {
-                    if let Some(pid) = corpus.vocab.get_phrase_id(t) {
-                        self.phrase_token_ids.push(pid);
-                        if let Some(tid) = corpus.vocab.get_term_id(t) {
-                            let len = corpus.get_posting_len(tid);
-                            if len == 0 {
-                                output.push_str("0 0\n");
-                                return;
-                            }
-                            if len < min_len {
-                                min_len = len;
-                                rarest_tid = Some(tid);
-                            }
-                        } else {
-                            output.push_str("0 0\n");
-                            return;
-                        }
-                    } else {
-                        output.push_str("0 0\n");
-                        return;
-                    }
-                }
-
-                let r_id = match rarest_tid {
-                    Some(id) => id,
-                    None => {
-                        output.push_str("0 0\n");
-                        return;
-                    }
-                };
-
-                let initial = match corpus.get_sparse_postings(r_id) {
-                    Some(p) => p,
-                    None => {
-                        output.push_str("0 0\n");
-                        return;
-                    }
-                };
-
-                self.candidate_docs.extend_from_slice(initial);
-
-                for t in terms {
-                    if let Some(tid) = corpus.vocab.get_term_id(t) {
-                        if tid == r_id {
-                            continue;
-                        }
-                        if let Some(postings) = corpus.get_sparse_postings(tid) {
-                            self.candidate_docs
-                                .retain(|doc_id| postings.binary_search(doc_id).is_ok());
-                        } else {
-                            output.push_str("0 0\n");
-                            return;
-                        }
-                    }
-                }
-
-                let k = self.phrase_token_ids.len();
-                let first_tok = self.phrase_token_ids[0];
-                let target = &self.phrase_token_ids[..];
-
-                for &doc_id in &self.candidate_docs {
-                    let id = doc_id as usize;
-                    let line_start = corpus.doc_line_offsets[id] as usize;
-                    let line_end = if id + 1 < corpus.doc_line_offsets.len() {
-                        corpus.doc_line_offsets[id + 1] as usize
-                    } else {
-                        corpus.docs_data.len()
-                    };
-                    let line = &corpus.docs_data[line_start..line_end];
-                    let tab_pos = match line.iter().position(|&b| b == b'\t') {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    let text = &line[tab_pos + 1..];
-
-                    self.doc_phrase_tokens.clear();
-                    for_each_token(text, &mut self.scratch, |tok| {
-                        let pid = corpus.vocab.get_phrase_id(tok).unwrap_or(SENTINEL_TOKEN_ID);
-                        self.doc_phrase_tokens.push(pid);
-                    });
-
-                    if self.doc_phrase_tokens.len() >= k {
-                        let mut pos = 0;
-                        let max_pos = self.doc_phrase_tokens.len() - k;
-                        let mut found = false;
-                        while pos <= max_pos {
-                            if self.doc_phrase_tokens[pos] == first_tok && &self.doc_phrase_tokens[pos..pos + k] == target {
-                                found = true;
-                                break;
-                            }
-                            pos += 1;
-                        }
-                        if found {
-                            self.matching_docs.push(doc_id);
-                        }
-                    }
-                }
-
-                let count = self.matching_docs.len();
+            ParsedQuery::Phrase { .. } => {
+                let docs = &corpus.phrase_postings[query_idx];
+                let count = docs.len();
                 if count == 0 {
                     output.push_str("0 0\n");
                 } else {
-                    let sum: u64 = self.matching_docs.iter().map(|&id| id as u64).sum();
+                    let sum: u64 = docs.iter().map(|&id| id as u64).sum();
                     let limit = count.min(10);
-                    format_result_into(count, sum, &self.matching_docs[..limit], output);
+                    format_result_into(count, sum, &docs[..limit], output);
                 }
             }
             ParsedQuery::Empty => {
@@ -1124,7 +1269,7 @@ pub fn parallel_evaluate_queries(
                     buf.clear();
                     let q = &queries[idx];
                     let t_start = std::time::Instant::now();
-                    evaluator.evaluate_parsed_query(q, corpus, &mut buf);
+                    evaluator.evaluate_parsed_query(idx, q, corpus, &mut buf);
                     let dt = t_start.elapsed().as_nanos() as u64;
                     match q {
                         ParsedQuery::Bool { .. } => bool_nanos += dt,
@@ -1247,21 +1392,21 @@ fn main() {
 
     let (corpus, docs_data) = if docs_len > 0 {
         let docs_data = mmap_file(&docs_file, docs_len).expect("mmap docs.txt failed");
-        let idx = CorpusIndex::build(docs_data, vocab, ingest_threads).expect("corpus index build failed");
+        let idx = CorpusIndex::build(docs_data, vocab, &parsed_queries, ingest_threads).expect("corpus index build failed");
         (idx, Some(docs_data))
     } else {
-        (CorpusIndex::build(&[], vocab, ingest_threads).expect("corpus index build failed"), None)
+        (CorpusIndex::build(&[], vocab, &parsed_queries, ingest_threads).expect("corpus index build failed"), None)
     };
     let t_ingest = t_ingest_start.elapsed();
-
-    let t_q_start = std::time::Instant::now();
-    let (results, t_bool_cpu, t_phrase_cpu) = parallel_evaluate_queries(&corpus, &parsed_queries, num_threads);
-    let t_query = t_q_start.elapsed();
 
     if let Some(data) = docs_data {
         munmap_file(data);
     }
     drop(docs_file);
+
+    let t_q_start = std::time::Instant::now();
+    let (results, t_bool_cpu, t_phrase_cpu) = parallel_evaluate_queries(&corpus, &parsed_queries, num_threads);
+    let t_query = t_q_start.elapsed();
 
     let mut output_str = String::with_capacity(parsed_queries.len() * 32);
     for res in &results {
@@ -1356,8 +1501,8 @@ PHRASE \"missing term here\"\n\
 PHRASE \"universal universal\"\n";
 
         let vocab = QueryVocabularies::extract(queries);
-        let corpus = CorpusIndex::build(&docs, vocab, 4).unwrap();
         let parsed_queries = parse_all_queries(queries);
+        let corpus = CorpusIndex::build(&docs, vocab, &parsed_queries, 4).unwrap();
 
         let (results, _, _) = parallel_evaluate_queries(&corpus, &parsed_queries, 4);
 

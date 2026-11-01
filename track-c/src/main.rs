@@ -278,6 +278,19 @@ impl CountryAgg {
         }
         self.seen_names[word_idx] |= bit_mask;
     }
+
+    #[inline(always)]
+    fn mark_name_fast(&mut self, name_id: u32) {
+        let word_idx = (name_id / 64) as usize;
+        let bit_mask = 1u64 << (name_id % 64);
+        if word_idx >= self.seen_names.len() {
+            let new_len = (word_idx + 1).next_power_of_two().max(2048);
+            self.seen_names.resize(new_len, 0);
+        }
+        unsafe {
+            *self.seen_names.get_unchecked_mut(word_idx) |= bit_mask;
+        }
+    }
 }
 
 struct WorkerState {
@@ -659,10 +672,15 @@ fn main() {
     let t_merge_0 = std::time::Instant::now();
     // Merge into worker 0
     let mut base_state = chunk_results.swap_remove(0);
+    for agg in base_state.aggs.iter_mut() {
+        if agg.count > 0 && agg.seen_names.len() < 2048 {
+            agg.seen_names.resize(2048, 0);
+        }
+    }
     let mut remap_buf = Vec::with_capacity(32 * 1024);
 
     while !chunk_results.is_empty() {
-        let other_worker = chunk_results.pop().unwrap();
+        let mut other_worker = chunk_results.pop().unwrap();
         remap_buf.clear();
         let other_count = other_worker.pool.len();
         for i in 0..other_count {
@@ -670,9 +688,10 @@ fn main() {
             let global_id = base_state.pool.intern(name, h);
             remap_buf.push(global_id);
         }
+        drop(other_worker.pool);
 
         for c in 0..=UNMATCHED_COUNTRY_IDX {
-            let other_agg = &other_worker.aggs[c];
+            let other_agg = &mut other_worker.aggs[c];
             if other_agg.count == 0 {
                 continue;
             }
@@ -690,17 +709,18 @@ fn main() {
                     continue;
                 }
                 let mut bits = word;
-                let base_bit = (w_idx * 64) as u32;
+                let base_bit = (w_idx * 64) as usize;
                 while bits != 0 {
-                    let trailing = bits.trailing_zeros();
-                    let local_id = (base_bit + trailing) as usize;
+                    let trailing = bits.trailing_zeros() as usize;
+                    let local_id = base_bit + trailing;
                     if local_id < remap_buf.len() {
                         let global_id = remap_buf[local_id];
-                        base_agg.mark_name(global_id);
+                        base_agg.mark_name_fast(global_id);
                     }
                     bits &= bits - 1;
                 }
             }
+            let _ = std::mem::take(&mut other_agg.seen_names);
         }
     }
 

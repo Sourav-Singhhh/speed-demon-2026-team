@@ -48,6 +48,48 @@ fn parse_hour_idx(ts: &[u8]) -> usize {
 }
 
 #[inline(always)]
+fn find_next_newline(chunk: &[u8], mut pos: usize) -> usize {
+    const MASK_01: u64 = 0x0101010101010101;
+    const MASK_80: u64 = 0x8080808080808080;
+    const SPLAT_0A: u64 = 0x0a0a0a0a0a0a0a0a;
+
+    let end = chunk.len();
+    while pos + 8 <= end {
+        let word = u64::from_ne_bytes(chunk[pos..pos + 8].try_into().unwrap());
+        let xor = word ^ SPLAT_0A;
+        if (xor.wrapping_sub(MASK_01) & !xor & MASK_80) != 0 {
+            break;
+        }
+        pos += 8;
+    }
+    while pos < end && chunk[pos] != b'\n' {
+        pos += 1;
+    }
+    pos
+}
+
+#[inline(always)]
+fn find_space(buf: &[u8], mut pos: usize) -> usize {
+    const MASK_01: u64 = 0x0101010101010101;
+    const MASK_80: u64 = 0x8080808080808080;
+    const SPLAT_20: u64 = 0x2020202020202020;
+
+    let end = buf.len();
+    while pos + 8 <= end {
+        let word = u64::from_ne_bytes(buf[pos..pos + 8].try_into().unwrap());
+        let xor = word ^ SPLAT_20;
+        if (xor.wrapping_sub(MASK_01) & !xor & MASK_80) != 0 {
+            break;
+        }
+        pos += 8;
+    }
+    while pos < end && buf[pos] != b' ' {
+        pos += 1;
+    }
+    pos
+}
+
+#[inline(always)]
 fn fast_hash(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     let mut chunks = bytes.chunks_exact(8);
@@ -67,48 +109,77 @@ const HASH_MASK: usize = HASH_TABLE_SIZE - 1;
 const EP_SET_SIZE: usize = 8192;
 const EP_SET_MASK: usize = EP_SET_SIZE - 1;
 
-struct LocalEpSet<'a> {
-    keys: Vec<&'a [u8]>,
-    table_hashes: Box<[u64; EP_SET_SIZE]>,
-    table_ids: Box<[u16; EP_SET_SIZE]>,
-}
-
-impl<'a> LocalEpSet<'a> {
-    fn new() -> Self {
-        Self {
-            keys: Vec::with_capacity(2048),
-            table_hashes: Box::new([0u64; EP_SET_SIZE]),
-            table_ids: Box::new([0xffffu16; EP_SET_SIZE]),
-        }
-    }
-
-    #[inline(always)]
-    fn insert_if_absent(&mut self, ep: &'a [u8]) {
-        let h = fast_hash(ep);
-        let mut slot = (h as usize) & EP_SET_MASK;
-        loop {
-            let id = self.table_ids[slot];
-            if id == 0xffff {
-                let new_id = self.keys.len() as u16;
-                self.keys.push(ep);
-                self.table_ids[slot] = new_id;
-                self.table_hashes[slot] = h;
-                return;
-            }
-            if self.table_hashes[slot] == h && self.keys[id as usize] == ep {
-                return;
-            }
-            slot = (slot + 1) & EP_SET_MASK;
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 struct CatSlot {
     hash: u64,
     prefix8: u64,
     len: u16,
     id: u16,
+}
+
+impl CatSlot {
+    #[inline(always)]
+    const fn empty() -> Self {
+        Self { hash: 0, prefix8: 0, len: 0, id: 0xffff }
+    }
+    #[inline(always)]
+    fn new(h: u64, prefix8: u64, len: u16, id: u16) -> Self {
+        Self { hash: h, prefix8, len, id }
+    }
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.id == 0xffff
+    }
+    #[inline(always)]
+    fn matches(&self, h: u64, prefix8: u64, len: u16) -> bool {
+        self.hash == h && self.len == len && self.prefix8 == prefix8
+    }
+}
+
+struct LocalEpSet<'a> {
+    keys: Vec<&'a [u8]>,
+    slots: Box<[CatSlot; EP_SET_SIZE]>,
+}
+
+impl<'a> LocalEpSet<'a> {
+    fn new() -> Self {
+        Self {
+            keys: Vec::with_capacity(2048),
+            slots: Box::new([CatSlot::empty(); EP_SET_SIZE]),
+        }
+    }
+
+    #[inline(always)]
+    fn insert_if_absent(&mut self, ep: &'a [u8]) {
+        let h = fast_hash(ep);
+        let ep_len = ep.len() as u16;
+        let mut ep_p8 = 0u64;
+        if ep.len() >= 8 {
+            ep_p8 = u64::from_ne_bytes(ep[..8].try_into().unwrap());
+        } else if !ep.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..ep.len()].copy_from_slice(ep);
+            ep_p8 = u64::from_ne_bytes(buf);
+        }
+
+        let mut slot = (h as usize) & EP_SET_MASK;
+        
+        loop {
+            let s = self.slots[slot];
+            if s.is_empty() {
+                let new_id = self.keys.len() as u16;
+                self.keys.push(ep);
+                self.slots[slot] = CatSlot::new(h, ep_p8, ep_len, new_id);
+                return;
+            }
+            if s.matches(h, ep_p8, ep_len) {
+                if ep.len() <= 8 || self.keys[s.id as usize] == ep {
+                    return;
+                }
+            }
+            slot = (slot + 1) & EP_SET_MASK;
+        }
+    }
 }
 
 struct FastCatalog {
@@ -118,7 +189,7 @@ struct FastCatalog {
 
 impl FastCatalog {
     fn new(sorted_endpoints: Vec<Vec<u8>>) -> Self {
-        let mut slots = vec![CatSlot { hash: 0, prefix8: 0, len: 0, id: 0xffff }; HASH_TABLE_SIZE];
+        let mut slots = vec![CatSlot::empty(); HASH_TABLE_SIZE];
 
         for (id, ep) in sorted_endpoints.iter().enumerate() {
             let h = fast_hash(ep);
@@ -131,15 +202,11 @@ impl FastCatalog {
                 prefix8 = u64::from_ne_bytes(buf);
             }
             let mut slot = (h as usize) & HASH_MASK;
-            while slots[slot].id != 0xffff {
+            
+            while !slots[slot].is_empty() {
                 slot = (slot + 1) & HASH_MASK;
             }
-            slots[slot] = CatSlot {
-                hash: h,
-                prefix8,
-                len: ep.len() as u16,
-                id: id as u16,
-            };
+            slots[slot] = CatSlot::new(h, prefix8, ep.len() as u16, id as u16);
         }
 
         Self {
@@ -162,9 +229,10 @@ impl FastCatalog {
         }
 
         let mut slot = (h as usize) & HASH_MASK;
+        
         loop {
             let s = self.slots[slot];
-            if s.id != 0xffff && s.hash == h && s.len == ep_len && s.prefix8 == ep_p8 {
+            if !s.is_empty() && s.matches(h, ep_p8, ep_len) {
                 if ep.len() <= 8 || self.keys[s.id as usize] == ep {
                     return s.id as usize;
                 }
@@ -268,27 +336,18 @@ fn main() {
                 let mut pos = 0;
                 while pos < chunk.len() {
                     let line_start = pos;
-                    while pos < chunk.len() && chunk[pos] != b'\n' {
-                        pos += 1;
-                    }
+                    pos = find_next_newline(chunk, pos);
                     let line = &chunk[line_start..pos];
-                    if pos < chunk.len() && chunk[pos] == b'\n' {
+                    if pos < chunk.len() {
                         pos += 1;
                     }
                     if line.len() < 32 {
                         continue;
                     }
-                    let mut p = 31;
-                    while p < line.len() && line[p] != b' ' {
-                        p += 1;
-                    }
-                    p += 1;
-                    let ep_start = p;
-                    while p < line.len() && line[p] != b' ' {
-                        p += 1;
-                    }
-                    let ep = &line[ep_start..p];
-                    set.insert_if_absent(ep);
+                    let p1 = find_space(line, 31);
+                    let ep_start = p1 + 1;
+                    let ep_end = find_space(line, ep_start);
+                    set.insert_if_absent(&line[ep_start..ep_end]);
                 }
                 set.keys.into_iter().map(|s| s.to_vec()).collect::<Vec<Vec<u8>>>()
             }));
@@ -323,32 +382,23 @@ fn main() {
                 let mut pos = 0;
                 while pos < chunk.len() {
                     let line_start = pos;
-                    while pos < chunk.len() && chunk[pos] != b'\n' {
-                        pos += 1;
-                    }
+                    pos = find_next_newline(chunk, pos);
                     let line = &chunk[line_start..pos];
-                    if pos < chunk.len() && chunk[pos] == b'\n' {
+                    if pos < chunk.len() {
                         pos += 1;
                     }
                     if line.len() < 32 {
                         continue;
                     }
                     let hour_idx = parse_hour_idx(&line[0..27]);
-                    let mut p = 31;
-                    while p < line.len() && line[p] != b' ' {
-                        p += 1;
-                    }
-                    p += 1;
-                    let ep_start = p;
-                    while p < line.len() && line[p] != b' ' {
-                        p += 1;
-                    }
-                    let ep_id = cat.get_id(&line[ep_start..p]);
+                    let p1 = find_space(line, 31);
+                    let ep_start = p1 + 1;
+                    let ep_end = find_space(line, ep_start);
+                    let ep_id = cat.get_id(&line[ep_start..ep_end]);
                     let group_id = hour_idx * num_endpoints + ep_id;
 
                     group_counts[group_id] += 1;
-                    p += 1;
-                    if line[p] == b'5' {
+                    if line.len() > ep_end + 1 && line[ep_end + 1] == b'5' {
                         group_errors[group_id] += 1;
                     }
                 }
@@ -405,31 +455,22 @@ fn main() {
                 let mut pos = 0;
                 while pos < chunk.len() {
                     let line_start = pos;
-                    while pos < chunk.len() && chunk[pos] != b'\n' {
-                        pos += 1;
-                    }
+                    pos = find_next_newline(chunk, pos);
                     let line = &chunk[line_start..pos];
-                    if pos < chunk.len() && chunk[pos] == b'\n' {
+                    if pos < chunk.len() {
                         pos += 1;
                     }
                     if line.len() < 32 {
                         continue;
                     }
                     let hour_idx = parse_hour_idx(&line[0..27]);
-                    let mut p = 31;
-                    while p < line.len() && line[p] != b' ' {
-                        p += 1;
-                    }
-                    p += 1;
-                    let ep_start = p;
-                    while p < line.len() && line[p] != b' ' {
-                        p += 1;
-                    }
-                    let ep_id = cat.get_id(&line[ep_start..p]);
+                    let p1 = find_space(line, 31);
+                    let ep_start = p1 + 1;
+                    let ep_end = find_space(line, ep_start);
+                    let ep_id = cat.get_id(&line[ep_start..ep_end]);
                     let group_id = hour_idx * num_endpoints + ep_id;
 
-                    p += 1; // start of status
-                    p += 4; // skip status (3 digits) + space
+                    let mut p = ep_end + 5; // skip space + status (3 digits) + space
                     let mut latency = 0u32;
                     while p < line.len() && line[p] >= b'0' && line[p] <= b'9' {
                         latency = latency * 10 + (line[p] - b'0') as u32;
@@ -463,11 +504,25 @@ fn main() {
                 for g in g_start..g_end {
                     let start = offsets_ref[g] as usize;
                     let end = offsets_ref[g + 1] as usize;
-                    if end > start {
+                    let count = end - start;
+                    if count > 0 {
                         let sub_slice = unsafe {
-                            std::slice::from_raw_parts_mut(base.add(start), end - start)
+                            std::slice::from_raw_parts_mut(base.add(start), count)
                         };
-                        sub_slice.sort_unstable();
+                        if count <= 16 {
+                            sub_slice.sort_unstable();
+                        } else {
+                            let r50 = (50 * count + 99) / 100 - 1;
+                            let r95 = (95 * count + 99) / 100 - 1;
+                            let r99 = (99 * count + 99) / 100 - 1;
+                            sub_slice.select_nth_unstable(r99);
+                            if r95 < r99 {
+                                sub_slice[..r99].select_nth_unstable(r95);
+                            }
+                            if r50 < r95 {
+                                sub_slice[..r95].select_nth_unstable(r50);
+                            }
+                        }
                     }
                 }
             });
