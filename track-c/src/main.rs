@@ -1,15 +1,12 @@
-use std::collections::HashMap;
 use std::env;
-use std::fs::File;
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
-const EMPTY_SLOT: u32 = u32::MAX;
-const ARENA_FLAG: u32 = 0x8000_0000;
+const UNMATCHED_COUNTRY_IDX: usize = 240;
 
 #[inline(always)]
-fn hash_name_u64(bytes: &[u8]) -> u64 {
+pub fn hash_name_u64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     let mut i = 0;
     while i + 8 <= bytes.len() {
@@ -23,218 +20,353 @@ fn hash_name_u64(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
         i += 1;
     }
-    if h == 0 {
-        1
-    } else {
-        h
-    }
+    h
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn mmap_readonly(file: &File, len: usize) -> Option<&'static [u8]> {
+fn mmap_file(file: &fs::File, len: usize) -> Result<&'static [u8], String> {
     use std::os::unix::io::AsRawFd;
     if len == 0 {
-        return Some(&[]);
+        return Ok(&[]);
     }
     let fd = file.as_raw_fd();
     let addr: *mut u8;
-    std::arch::asm!(
-        "syscall",
-        in("rax") 9usize, in("rdi") 0usize, in("rsi") len, in("rdx") 1usize,
-        in("r10") 2usize, in("r8") fd, in("r9") 0usize,
-        lateout("rax") addr, lateout("rcx") _, lateout("r11") _,
-    );
-    if (addr as isize) < 0 && (addr as isize) > -4096 {
-        None
-    } else {
-        Some(std::slice::from_raw_parts(addr, len))
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            in("rax") 9usize,
+            in("rdi") 0usize,
+            in("rsi") len,
+            in("rdx") 1usize,
+            in("r10") 2usize,
+            in("r8") fd,
+            in("r9") 0usize,
+            lateout("rax") addr,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
     }
+    if (addr as isize) < 0 && (addr as isize) > -4096 {
+        return Err(format!("mmap failed with errno {}", -(addr as isize)));
+    }
+    unsafe { Ok(std::slice::from_raw_parts(addr, len)) }
 }
 
 #[cfg(not(target_os = "linux"))]
-unsafe fn mmap_readonly(_file: &File, _len: usize) -> Option<&'static [u8]> {
-    None
+fn mmap_file(_file: &fs::File, _len: usize) -> Result<&'static [u8], String> {
+    Err("mmap only on linux".to_string())
 }
 
-fn read_file_or_mmap(path: &Path) -> &'static [u8] {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return &[],
-    };
-    let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-    if len == 0 {
-        return &[];
-    }
-    if let Some(slice) = unsafe { mmap_readonly(&file, len) } {
-        slice
+fn read_file_bytes(path: &Path) -> Result<&'static [u8], String> {
+    let file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len() as usize;
+    if let Ok(mapped) = mmap_file(&file, len) {
+        Ok(mapped)
     } else {
-        let bytes = std::fs::read(path).unwrap_or_default().into_boxed_slice();
-        let ptr = bytes.as_ptr();
-        let blen = bytes.len();
-        std::mem::forget(bytes);
-        unsafe { std::slice::from_raw_parts(ptr, blen) }
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        let boxed = bytes.into_boxed_slice();
+        let out = unsafe { std::slice::from_raw_parts(boxed.as_ptr(), boxed.len()) };
+        std::mem::forget(boxed);
+        Ok(out)
+    }
+}
+
+struct RegionLookup {
+    region_to_country: Vec<u8>,
+    hash_keys: Vec<u32>,
+    hash_values: Vec<u8>,
+    hash_mask: usize,
+    countries: Vec<[u8; 3]>,
+    use_hash: bool,
+}
+
+impl RegionLookup {
+    fn parse(data: &[u8]) -> Self {
+        let mut country_seen = [false; 26 * 26 * 26];
+        let mut country_names: Vec<[u8; 3]> = Vec::with_capacity(256);
+
+        let mut pos = 0;
+        while pos < data.len() && data[pos] != b'\n' { pos += 1; }
+        if pos < data.len() && data[pos] == b'\n' { pos += 1; }
+
+        let mut max_region = 0usize;
+        let mut entries = Vec::with_capacity(131072);
+        while pos < data.len() {
+            let mut rid = 0usize;
+            while pos < data.len() && data[pos] != b',' {
+                let b = data[pos];
+                rid = rid * 10 + (b.wrapping_sub(b'0')) as usize;
+                pos += 1;
+            }
+            if pos < data.len() && data[pos] == b',' { pos += 1; }
+            if rid > max_region { max_region = rid; }
+
+            if pos + 3 <= data.len()
+                && data[pos] >= b'A' && data[pos] <= b'Z'
+                && data[pos + 1] >= b'A' && data[pos + 1] <= b'Z'
+                && data[pos + 2] >= b'A' && data[pos + 2] <= b'Z'
+            {
+                let c0 = (data[pos] - b'A') as usize;
+                let c1 = (data[pos + 1] - b'A') as usize;
+                let c2 = (data[pos + 2] - b'A') as usize;
+                let code_idx = (c0 * 676 + c1 * 26 + c2) as u16;
+                entries.push((rid as u32, code_idx));
+                if !country_seen[code_idx as usize] {
+                    country_seen[code_idx as usize] = true;
+                    country_names.push([data[pos], data[pos + 1], data[pos + 2]]);
+                }
+            }
+            while pos < data.len() && data[pos] != b'\n' { pos += 1; }
+            if pos < data.len() && data[pos] == b'\n' { pos += 1; }
+        }
+
+        country_names.sort_unstable();
+        let mut code_to_country = [UNMATCHED_COUNTRY_IDX as u8; 26 * 26 * 26];
+        for (i, code) in country_names.iter().enumerate() {
+            let c0 = (code[0] - b'A') as usize;
+            let c1 = (code[1] - b'A') as usize;
+            let c2 = (code[2] - b'A') as usize;
+            code_to_country[c0 * 676 + c1 * 26 + c2] = i as u8;
+        }
+
+        if max_region <= 1_500_000 {
+            let mut region_to_country = vec![UNMATCHED_COUNTRY_IDX as u8; max_region + 1];
+            for (rid, code_idx) in entries {
+                region_to_country[rid as usize] = code_to_country[code_idx as usize];
+            }
+            Self {
+                region_to_country,
+                hash_keys: Vec::new(),
+                hash_values: Vec::new(),
+                hash_mask: 0,
+                countries: country_names,
+                use_hash: false,
+            }
+        } else {
+            let hash_cap = 262144;
+            let hash_mask = hash_cap - 1;
+            let mut hash_keys = vec![0u32; hash_cap];
+            let mut hash_values = vec![UNMATCHED_COUNTRY_IDX as u8; hash_cap];
+            for (rid, code_idx) in entries {
+                let mut idx = (rid.wrapping_mul(0x9E3779B9) as usize) & hash_mask;
+                while hash_keys[idx] != 0 && hash_keys[idx] != rid {
+                    idx = (idx + 1) & hash_mask;
+                }
+                hash_keys[idx] = rid;
+                hash_values[idx] = code_to_country[code_idx as usize];
+            }
+            Self {
+                region_to_country: Vec::new(),
+                hash_keys,
+                hash_values,
+                hash_mask,
+                countries: country_names,
+                use_hash: true,
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn get_country(&self, rid: usize) -> usize {
+        if !self.use_hash {
+            if rid < self.region_to_country.len() {
+                unsafe { *self.region_to_country.get_unchecked(rid) as usize }
+            } else {
+                UNMATCHED_COUNTRY_IDX
+            }
+        } else {
+            let mut idx = ((rid as u32).wrapping_mul(0x9E3779B9) as usize) & self.hash_mask;
+            loop {
+                let k = self.hash_keys[idx];
+                if k == rid as u32 {
+                    return self.hash_values[idx] as usize;
+                }
+                if k == 0 {
+                    return UNMATCHED_COUNTRY_IDX;
+                }
+                idx = (idx + 1) & self.hash_mask;
+            }
+        }
+    }
+}
+
+const NAME_EMPTY_SENTINEL: u32 = 0xFFFF_FFFF;
+const ARENA_FLAG: u32 = 0x8000_0000;
+
+#[derive(Clone, Copy)]
+pub struct NameSlot {
+    pub hash_tag: u32,
+    pub offset: u32,
+    pub len: u32,
+    pub name_id: u32,
+}
+
+impl Default for NameSlot {
+    fn default() -> Self {
+        Self {
+            hash_tag: 0,
+            offset: 0,
+            len: 0,
+            name_id: NAME_EMPTY_SENTINEL,
+        }
     }
 }
 
 #[derive(Clone, Copy)]
-struct Slot {
-    tag: u32,
-    offset: u32,
-    len: u32,
-    id: u32,
+pub struct NameEntry {
+    pub offset: u32,
+    pub len: u32,
+    pub hash: u64,
 }
 
-#[derive(Clone, Copy)]
-struct Entry {
-    offset: u32,
-    len: u32,
-    hash: u64,
+#[inline(always)]
+pub fn hash_tag_from_u64(h: u64) -> u32 {
+    (h ^ (h >> 32)) as u32
 }
 
-struct NamePool<'a> {
-    slots: Vec<Slot>,
+pub struct NamePool<'a> {
+    slots: Vec<NameSlot>,
     arena: Vec<u8>,
-    entries: Vec<Entry>,
+    entries: Vec<NameEntry>,
     count: usize,
     mask: usize,
     file_data: &'a [u8],
 }
 
 impl<'a> NamePool<'a> {
-    fn new(cap: usize, file_data: &'a [u8]) -> Self {
-        let size = cap.next_power_of_two().max(32768);
+    pub fn new(capacity: usize, file_data: &'a [u8]) -> Self {
+        let cap = capacity.next_power_of_two().max(1024);
         Self {
-            slots: vec![
-                Slot {
-                    tag: 0,
-                    offset: 0,
-                    len: 0,
-                    id: EMPTY_SLOT
-                };
-                size
-            ],
+            slots: vec![NameSlot::default(); cap],
             arena: Vec::with_capacity(4096),
-            entries: Vec::with_capacity(size / 2),
+            entries: Vec::with_capacity(cap / 2),
             count: 0,
-            mask: size - 1,
+            mask: cap - 1,
             file_data,
         }
     }
 
     #[inline(always)]
-    fn get_bytes(&self, offset: u32, len: usize) -> &[u8] {
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    #[inline(always)]
+    fn get_name_bytes(&self, offset: u32, len: usize) -> &[u8] {
         if (offset & ARENA_FLAG) != 0 {
             let start = (offset & !ARENA_FLAG) as usize;
             &self.arena[start..start + len]
         } else {
-            &self.file_data[offset as usize..(offset as usize) + len]
+            let start = offset as usize;
+            &self.file_data[start..start + len]
         }
     }
 
     fn grow(&mut self) {
-        let new_size = self.slots.len() * 2;
-        let new_mask = new_size - 1;
-        let mut new_slots = vec![
-            Slot {
-                tag: 0,
-                offset: 0,
-                len: 0,
-                id: EMPTY_SLOT
-            };
-            new_size
-        ];
+        let new_cap = self.slots.len() * 2;
+        let new_mask = new_cap - 1;
+        let mut new_slots = vec![NameSlot::default(); new_cap];
+
         for slot in self.slots.iter() {
-            if slot.id != EMPTY_SLOT {
-                let h64 = self.entries[slot.id as usize].hash;
+            if slot.name_id != NAME_EMPTY_SENTINEL {
+                let h64 = self.entries[slot.name_id as usize].hash;
                 let mut idx = (h64 as usize) & new_mask;
-                while new_slots[idx].id != EMPTY_SLOT {
+                while new_slots[idx].name_id != NAME_EMPTY_SENTINEL {
                     idx = (idx + 1) & new_mask;
                 }
                 new_slots[idx] = *slot;
             }
         }
+
         self.slots = new_slots;
         self.mask = new_mask;
     }
 
     #[inline(always)]
-    fn intern_ref(&mut self, offset: usize, len: usize, h64: u64) -> u32 {
-        let tag = (h64 ^ (h64 >> 32)) as u32;
+    pub fn intern_ref(&mut self, file_offset: usize, len: usize, h64: u64) -> u32 {
+        let tag = hash_tag_from_u64(h64);
         let mut idx = (h64 as usize) & self.mask;
-        let target = &self.file_data[offset..offset + len];
+        let target = &self.file_data[file_offset..file_offset + len];
+
         loop {
             let slot = self.slots[idx];
-            if slot.id == EMPTY_SLOT {
+            if slot.name_id == NAME_EMPTY_SENTINEL {
                 if (self.count + 1) * 4 >= self.slots.len() * 3 {
                     self.grow();
-                    return self.intern_ref(offset, len, h64);
+                    return self.intern_ref(file_offset, len, h64);
                 }
+
                 let id = self.count as u32;
-                let off_u32 = offset as u32;
-                self.slots[idx] = Slot {
-                    tag,
+                let off_u32 = file_offset as u32;
+                self.slots[idx] = NameSlot {
+                    hash_tag: tag,
                     offset: off_u32,
                     len: len as u32,
-                    id,
+                    name_id: id,
                 };
-                self.entries.push(Entry {
-                    offset: off_u32,
-                    len: len as u32,
-                    hash: h64,
-                });
+                self.entries.push(NameEntry { offset: off_u32, len: len as u32, hash: h64 });
                 self.count += 1;
                 return id;
             }
-            if slot.tag == tag
-                && slot.len as usize == len
-                && self.get_bytes(slot.offset, len) == target
-            {
-                return slot.id;
+
+            if slot.hash_tag == tag && slot.len as usize == len {
+                let bytes = self.get_name_bytes(slot.offset, len);
+                if bytes == target {
+                    return slot.name_id;
+                }
             }
             idx = (idx + 1) & self.mask;
         }
     }
 
     #[inline(always)]
-    fn intern_slice(&mut self, slice: &[u8], h64: u64) -> u32 {
-        let tag = (h64 ^ (h64 >> 32)) as u32;
+    pub fn intern_slice(&mut self, name: &[u8], h64: u64) -> u32 {
+        let tag = hash_tag_from_u64(h64);
         let mut idx = (h64 as usize) & self.mask;
+
         loop {
             let slot = self.slots[idx];
-            if slot.id == EMPTY_SLOT {
+            if slot.name_id == NAME_EMPTY_SENTINEL {
                 if (self.count + 1) * 4 >= self.slots.len() * 3 {
                     self.grow();
-                    return self.intern_slice(slice, h64);
+                    return self.intern_slice(name, h64);
                 }
+
+                let off = self.arena.len() as u32;
+                self.arena.extend_from_slice(name);
+                let off_u32 = off | ARENA_FLAG;
+
                 let id = self.count as u32;
-                let off = (self.arena.len() as u32) | ARENA_FLAG;
-                self.arena.extend_from_slice(slice);
-                self.slots[idx] = Slot {
-                    tag,
-                    offset: off,
-                    len: slice.len() as u32,
-                    id,
+                self.slots[idx] = NameSlot {
+                    hash_tag: tag,
+                    offset: off_u32,
+                    len: name.len() as u32,
+                    name_id: id,
                 };
-                self.entries.push(Entry {
-                    offset: off,
-                    len: slice.len() as u32,
-                    hash: h64,
-                });
+                self.entries.push(NameEntry { offset: off_u32, len: name.len() as u32, hash: h64 });
                 self.count += 1;
                 return id;
             }
-            if slot.tag == tag
-                && slot.len as usize == slice.len()
-                && self.get_bytes(slot.offset, slice.len()) == slice
-            {
-                return slot.id;
+
+            if slot.hash_tag == tag && slot.len as usize == name.len() {
+                let bytes = self.get_name_bytes(slot.offset, name.len());
+                if bytes == name {
+                    return slot.name_id;
+                }
             }
             idx = (idx + 1) & self.mask;
         }
     }
+
+    #[inline(always)]
+    pub fn get_name_entry(&self, id: u32) -> (NameEntry, &[u8]) {
+        let entry = self.entries[id as usize];
+        let bytes = self.get_name_bytes(entry.offset, entry.len as usize);
+        (entry, bytes)
+    }
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 struct CountryAgg {
     count: u64,
     id_sum: u64,
@@ -247,160 +379,29 @@ struct CountryAgg {
 }
 
 impl CountryAgg {
-    fn new() -> Self {
-        Self {
-            count: 0,
-            id_sum: 0,
-            amount_sum: 0,
-            amount_min: i64::MAX,
-            amount_max: i64::MIN,
-            name_bytes: 0,
-            note_bytes: 0,
-            seen_names: vec![0u64; 2048],
+    #[inline(always)]
+    fn mark_name(&mut self, name_id: u32) {
+        let word_idx = (name_id / 64) as usize;
+        let bit_mask = 1u64 << (name_id % 64);
+        if word_idx >= self.seen_names.len() {
+            let new_len = (word_idx + 1).next_power_of_two().max(16);
+            self.seen_names.resize(new_len, 0);
         }
+        self.seen_names[word_idx] |= bit_mask;
     }
 
     #[inline(always)]
-    fn update(&mut self, id: u64, amount: i64, n_bytes: u64, note_b: u64) {
-        self.count += 1;
-        self.id_sum += id;
-        self.amount_sum += amount;
-        self.amount_min = self.amount_min.min(amount);
-        self.amount_max = self.amount_max.max(amount);
-        self.name_bytes += n_bytes;
-        self.note_bytes += note_b;
-    }
-
-    #[inline(always)]
-    fn mark_name(&mut self, nid: u32) {
-        let word_idx = (nid / 64) as usize;
-        let mask = 1u64 << (nid % 64);
+    fn mark_name_fast(&mut self, name_id: u32) {
+        let word_idx = (name_id / 64) as usize;
+        let bit_mask = 1u64 << (name_id % 64);
         if word_idx >= self.seen_names.len() {
             let new_len = (word_idx + 1).next_power_of_two().max(2048);
             self.seen_names.resize(new_len, 0);
         }
         unsafe {
-            *self.seen_names.get_unchecked_mut(word_idx) |= mask;
+            *self.seen_names.get_unchecked_mut(word_idx) |= bit_mask;
         }
     }
-}
-
-struct RegionTable {
-    direct: Vec<u16>,
-    fallback: HashMap<u32, u16>,
-    countries: Vec<[u8; 3]>,
-    unmatched_idx: u16,
-}
-
-impl RegionTable {
-    fn parse(bytes: &[u8]) -> Self {
-        let mut pos = 0;
-        while pos < bytes.len() && bytes[pos] != b'\n' {
-            pos += 1;
-        }
-        if pos < bytes.len() {
-            pos += 1;
-        }
-
-        let mut country_map: HashMap<[u8; 3], u16> = HashMap::new();
-        let mut country_list = Vec::new();
-        let mut direct = vec![u16::MAX; 1_000_000];
-        let mut fallback = HashMap::new();
-
-        while pos < bytes.len() {
-            if bytes[pos] == b'\n' || bytes[pos] == b'\r' {
-                pos += 1;
-                continue;
-            }
-            let mut rid = 0u32;
-            while pos < bytes.len() && bytes[pos] != b',' {
-                rid = rid * 10 + (bytes[pos] - b'0') as u32;
-                pos += 1;
-            }
-            if pos < bytes.len() {
-                pos += 1;
-            }
-            let c_start = pos;
-            while pos < bytes.len() && bytes[pos] != b'\n' && bytes[pos] != b'\r' {
-                pos += 1;
-            }
-            let c_bytes = &bytes[c_start..pos];
-            if c_bytes.len() == 3 {
-                let code = [c_bytes[0], c_bytes[1], c_bytes[2]];
-                let next_idx = country_list.len() as u16;
-                let c_idx = *country_map.entry(code).or_insert_with(|| {
-                    country_list.push(code);
-                    next_idx
-                });
-                if (rid as usize) < direct.len() {
-                    direct[rid as usize] = c_idx;
-                } else {
-                    fallback.insert(rid, c_idx);
-                }
-            }
-            while pos < bytes.len() && (bytes[pos] == b'\n' || bytes[pos] == b'\r') {
-                pos += 1;
-            }
-        }
-        let unmatched_idx = country_list.len() as u16;
-        Self {
-            direct,
-            fallback,
-            countries: country_list,
-            unmatched_idx,
-        }
-    }
-
-    #[inline(always)]
-    fn get_country(&self, rid: u32) -> usize {
-        let r = rid as usize;
-        if r < self.direct.len() {
-            let c = self.direct[r];
-            if c != u16::MAX {
-                c as usize
-            } else {
-                self.unmatched_idx as usize
-            }
-        } else {
-            self.fallback
-                .get(&rid)
-                .copied()
-                .unwrap_or(self.unmatched_idx) as usize
-        }
-    }
-}
-
-fn find_chunk_boundaries(data: &[u8], num_chunks: usize) -> Vec<usize> {
-    if num_chunks <= 1 {
-        return vec![0, data.len()];
-    }
-    let chunk_size = data.len() / num_chunks;
-    let mut boundaries = vec![0; num_chunks + 1];
-    boundaries[num_chunks] = data.len();
-
-    let mut in_quote = false;
-    let mut chunk_idx = 1;
-    let mut target = chunk_size;
-    let mut pos = 0;
-
-    while pos < data.len() && chunk_idx < num_chunks {
-        let b = data[pos];
-        if b == b'"' {
-            in_quote = !in_quote;
-        } else if b == b'\n' && !in_quote {
-            if pos + 1 >= target {
-                boundaries[chunk_idx] = pos + 1;
-                chunk_idx += 1;
-                target = chunk_idx * chunk_size;
-            }
-        }
-        pos += 1;
-    }
-    while chunk_idx < num_chunks {
-        boundaries[chunk_idx] = data.len();
-        chunk_idx += 1;
-    }
-    boundaries
 }
 
 struct WorkerState<'a> {
@@ -408,20 +409,25 @@ struct WorkerState<'a> {
     pool: NamePool<'a>,
 }
 
-fn parse_chunk<'a>(
-    payload: &'a [u8],
-    start: usize,
-    end: usize,
-    num_countries: usize,
-    regions: &RegionTable,
+fn parse_records_chunk<'a>(
+    full_payload: &'a [u8],
+    chunk_start: usize,
+    chunk_end: usize,
+    lookup: &RegionLookup,
 ) -> WorkerState<'a> {
-    let mut aggs = vec![CountryAgg::new(); num_countries];
-    let mut pool = NamePool::new(16384, payload);
+    let mut aggs = vec![CountryAgg {
+        amount_min: i64::MAX,
+        amount_max: i64::MIN,
+        ..Default::default()
+    }; UNMATCHED_COUNTRY_IDX + 1];
+
+    let mut pool = NamePool::new(32768, full_payload);
+    let mut pos = chunk_start;
+    let end = chunk_end;
     let mut scratch = Vec::with_capacity(256);
-    let mut pos = start;
 
     while pos < end {
-        if pos + 3 <= end && &payload[pos..pos + 3] == BOM {
+        if pos + 2 < end && &full_payload[pos..pos + 3] == BOM {
             pos += 3;
         }
         if pos >= end {
@@ -429,28 +435,30 @@ fn parse_chunk<'a>(
         }
 
         // Col 0: id
-        let mut id = 0u64;
-        while pos < end && payload[pos] != b',' {
-            id = id * 10 + (payload[pos] - b'0') as u64;
+        let mut id_val = 0u64;
+        while pos < end && full_payload[pos] != b',' {
+            let b = full_payload[pos];
+            id_val = id_val * 10 + (b - b'0') as u64;
             pos += 1;
         }
-        if pos < end {
+        if pos < end && full_payload[pos] == b',' {
             pos += 1;
         }
 
         // Col 1: name
-        let (name_len, name_id) = if pos < end && payload[pos] == b',' {
+        let (name_len, name_id) = if pos < end && full_payload[pos] == b',' {
             pos += 1;
-            (0u64, pool.intern_slice(b"", hash_name_u64(b"")))
-        } else if pos < end && payload[pos] == b'"' {
+            let nid = pool.intern_slice(b"", hash_name_u64(b""));
+            (0u64, nid)
+        } else if pos < end && full_payload[pos] == b'"' {
             pos += 1;
-            let start_name = pos;
             let mut unescaped_len = 0usize;
             let mut has_escapes = false;
-
+            let start_name = pos;
             while pos < end {
-                if payload[pos] == b'"' {
-                    if pos + 1 < end && payload[pos + 1] == b'"' {
+                let b = full_payload[pos];
+                if b == b'"' {
+                    if pos + 1 < end && full_payload[pos + 1] == b'"' {
                         has_escapes = true;
                         unescaped_len += 1;
                         pos += 2;
@@ -463,129 +471,199 @@ fn parse_chunk<'a>(
                     pos += 1;
                 }
             }
-
             let nid = if has_escapes {
                 scratch.clear();
+                scratch.reserve(unescaped_len);
                 let mut i = start_name;
                 while i < pos - 1 {
-                    if payload[i] == b'"' && payload[i + 1] == b'"' {
+                    if full_payload[i] == b'"' && full_payload[i + 1] == b'"' {
                         scratch.push(b'"');
                         i += 2;
                     } else {
-                        scratch.push(payload[i]);
+                        scratch.push(full_payload[i]);
                         i += 1;
                     }
                 }
                 let h = hash_name_u64(&scratch);
                 pool.intern_slice(&scratch, h)
             } else {
-                let slen = (pos - 1) - start_name;
-                let h = hash_name_u64(&payload[start_name..start_name + slen]);
-                pool.intern_ref(start_name, slen, h)
+                let slice_len = (pos - 1) - start_name;
+                let h = hash_name_u64(&full_payload[start_name..start_name + slice_len]);
+                pool.intern_ref(start_name, slice_len, h)
             };
-            if pos < end && payload[pos] == b',' {
+            if pos < end && full_payload[pos] == b',' {
                 pos += 1;
             }
             (unescaped_len as u64, nid)
         } else {
             let start_name = pos;
-            while pos < end && payload[pos] != b',' {
+            while pos < end && full_payload[pos] != b',' {
                 pos += 1;
             }
-            let slen = pos - start_name;
-            let h = hash_name_u64(&payload[start_name..pos]);
-            let nid = pool.intern_ref(start_name, slen, h);
-            if pos < end {
+            let len = pos - start_name;
+            let h = hash_name_u64(&full_payload[start_name..pos]);
+            let nid = pool.intern_ref(start_name, len, h);
+            if pos < end && full_payload[pos] == b',' {
                 pos += 1;
             }
-            (slen as u64, nid)
+            (len as u64, nid)
         };
 
         // Col 2: note
-        let note_len: u64 = if pos < end && payload[pos] == b',' {
+        let note_len: u64 = if pos < end && full_payload[pos] == b',' {
             pos += 1;
             0
-        } else if pos < end && payload[pos] == b'"' {
+        } else if pos < end && full_payload[pos] == b'"' {
             pos += 1;
-            let mut unescaped = 0u64;
+            let start_note = pos;
+            let mut num_quotes = 0usize;
             while pos < end {
-                if payload[pos] == b'"' {
-                    if pos + 1 < end && payload[pos + 1] == b'"' {
-                        unescaped += 1;
+                if full_payload[pos] == b'"' {
+                    if pos + 1 < end && full_payload[pos + 1] == b'"' {
+                        num_quotes += 1;
                         pos += 2;
                     } else {
                         pos += 1;
                         break;
                     }
                 } else {
-                    unescaped += 1;
                     pos += 1;
                 }
             }
-            if pos < end && payload[pos] == b',' {
+            let raw_len = (pos - 1) - start_note;
+            if pos < end && full_payload[pos] == b',' {
                 pos += 1;
             }
-            unescaped
+            (raw_len - num_quotes) as u64
         } else {
             let start_note = pos;
-            while pos < end && payload[pos] != b',' {
+            while pos < end && full_payload[pos] != b',' {
                 pos += 1;
             }
             let len = (pos - start_note) as u64;
-            if pos < end {
+            if pos < end && full_payload[pos] == b',' {
                 pos += 1;
             }
             len
         };
 
         // Col 3: region_id
-        let mut rid = 0u32;
-        while pos < end && payload[pos] != b',' {
-            rid = rid * 10 + (payload[pos] - b'0') as u32;
+        let mut region_val = 0usize;
+        while pos < end && full_payload[pos] != b',' {
+            let b = full_payload[pos];
+            region_val = region_val * 10 + (b - b'0') as usize;
             pos += 1;
         }
-        if pos < end {
+        if pos < end && full_payload[pos] == b',' {
             pos += 1;
         }
 
         // Col 4: amount
-        let neg = if pos < end && payload[pos] == b'-' {
-            pos += 1;
-            true
-        } else {
-            false
-        };
-        let mut whole = 0i64;
-        while pos < end && payload[pos] != b'.' {
-            whole = whole * 10 + (payload[pos] - b'0') as i64;
+        let mut neg = false;
+        if pos < end && full_payload[pos] == b'-' {
+            neg = true;
             pos += 1;
         }
-        if pos < end && payload[pos] == b'.' {
+        let mut dollars = 0i64;
+        while pos < end && full_payload[pos] != b'.' && full_payload[pos] != b'\r' && full_payload[pos] != b'\n' {
+            let b = full_payload[pos];
+            dollars = dollars * 10 + (b - b'0') as i64;
             pos += 1;
         }
-        let mut cents = whole * 100;
-        if pos < end && payload[pos] >= b'0' && payload[pos] <= b'9' {
-            cents += (payload[pos] - b'0') as i64 * 10;
+        let mut cents = dollars * 100;
+        if pos < end && full_payload[pos] == b'.' {
             pos += 1;
-        }
-        if pos < end && payload[pos] >= b'0' && payload[pos] <= b'9' {
-            cents += (payload[pos] - b'0') as i64;
-            pos += 1;
+            if pos < end && full_payload[pos] >= b'0' && full_payload[pos] <= b'9' {
+                cents += ((full_payload[pos] - b'0') as i64) * 10;
+                pos += 1;
+            }
+            if pos < end && full_payload[pos] >= b'0' && full_payload[pos] <= b'9' {
+                cents += (full_payload[pos] - b'0') as i64;
+                pos += 1;
+            }
         }
         if neg {
             cents = -cents;
         }
-        while pos < end && (payload[pos] == b'\r' || payload[pos] == b'\n') {
+        if pos < end && full_payload[pos] == b'\r' {
+            pos += 1;
+        }
+        if pos < end && full_payload[pos] == b'\n' {
             pos += 1;
         }
 
-        let c_idx = regions.get_country(rid);
-        aggs[c_idx].update(id, cents, name_len, note_len);
-        aggs[c_idx].mark_name(name_id);
+        // Grouping & aggregation
+        let c_idx = lookup.get_country(region_val);
+        let agg = &mut aggs[c_idx];
+        agg.count += 1;
+        agg.id_sum += id_val;
+        agg.amount_sum += cents;
+        if cents < agg.amount_min {
+            agg.amount_min = cents;
+        }
+        if cents > agg.amount_max {
+            agg.amount_max = cents;
+        }
+        agg.name_bytes += name_len;
+        agg.note_bytes += note_len;
+        agg.mark_name(name_id);
     }
+
     WorkerState { aggs, pool }
 }
 
+fn find_chunk_boundaries(data: &[u8], num_chunks: usize) -> Vec<usize> {
+    if num_chunks <= 1 {
+        return vec![0, data.len()];
+    }
+
+    let chunk_size = data.len() / num_chunks;
+    let mut boundaries = vec![0; num_chunks + 1];
+    boundaries[num_chunks] = data.len();
+
+    let mut in_quote = false;
+    let mut chunk_idx = 1;
+    let mut next_target = chunk_size;
+
+    let mut pos = 0;
+    while pos < data.len() && chunk_idx < num_chunks {
+        // Fast skip 8 bytes if neither quote nor newline is present
+        while pos + 8 <= data.len() {
+            let w = u64::from_ne_bytes(data[pos..pos + 8].try_into().unwrap());
+            let q_mask = (w ^ 0x2222222222222222).wrapping_sub(0x0101010101010101) & !(w ^ 0x2222222222222222) & 0x8080808080808080;
+            let n_mask = (w ^ 0x0A0A0A0A0A0A0A0A).wrapping_sub(0x0101010101010101) & !(w ^ 0x0A0A0A0A0A0A0A0A) & 0x8080808080808080;
+            if (q_mask | n_mask) != 0 {
+                break;
+            }
+            pos += 8;
+        }
+        while pos < data.len() && chunk_idx < num_chunks {
+            let b = data[pos];
+            if b == b'"' {
+                in_quote = !in_quote;
+            } else if b == b'\n' && !in_quote {
+                let next_line_start = pos + 1;
+                if next_line_start >= next_target {
+                    boundaries[chunk_idx] = next_line_start;
+                    chunk_idx += 1;
+                    next_target = chunk_idx * chunk_size;
+                    pos += 1;
+                    break;
+                }
+            }
+            pos += 1;
+        }
+    }
+
+    while chunk_idx < num_chunks {
+        boundaries[chunk_idx] = data.len();
+        chunk_idx += 1;
+    }
+
+    boundaries
+}
+
+#[inline(always)]
 fn write_money(out: &mut Vec<u8>, cents: i64) {
     if cents < 0 {
         out.push(b'-');
@@ -593,6 +671,7 @@ fn write_money(out: &mut Vec<u8>, cents: i64) {
     let abs_cents = cents.unsigned_abs();
     let dollars = abs_cents / 100;
     let rem = abs_cents % 100;
+
     let mut tmp = [0u8; 24];
     let mut i = 0;
     let mut d = dollars;
@@ -610,11 +689,13 @@ fn write_money(out: &mut Vec<u8>, cents: i64) {
         i -= 1;
         out.push(tmp[i]);
     }
+
     out.push(b'.');
     out.push(b'0' + (rem / 10) as u8);
     out.push(b'0' + (rem % 10) as u8);
 }
 
+#[inline(always)]
 fn write_u64(out: &mut Vec<u8>, mut val: u64) {
     if val == 0 {
         out.push(b'0');
@@ -633,47 +714,22 @@ fn write_u64(out: &mut Vec<u8>, mut val: u64) {
     }
 }
 
-fn write_line(out: &mut Vec<u8>, code: &[u8], agg: &CountryAgg) {
-    out.extend_from_slice(code);
-    out.push(b' ');
-    write_u64(out, agg.count);
-    out.push(b' ');
-    write_u64(out, agg.id_sum);
-    out.push(b' ');
-    write_money(out, agg.amount_sum);
-    out.push(b' ');
-    write_money(out, agg.amount_min);
-    out.push(b' ');
-    write_money(out, agg.amount_max);
-    out.push(b' ');
-    let distinct: u64 = agg.seen_names.iter().map(|w| w.count_ones() as u64).sum();
-    write_u64(out, distinct);
-    out.push(b' ');
-    write_u64(out, agg.name_bytes);
-    out.push(b' ');
-    write_u64(out, agg.note_bytes);
-    out.push(b'\n');
-}
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     let data_dir = if args.len() > 1 { &args[1] } else { "/data" };
     let out_dir = if args.len() > 2 { &args[2] } else { "/out" };
 
-    let out_path = Path::new(out_dir).join("aggregates.txt");
+    let out_dir_path = Path::new(out_dir);
+    fs::create_dir_all(out_dir_path).expect("create out dir failed");
+    let out_file = out_dir_path.join("aggregates.txt");
+
     let reg_path = Path::new(data_dir).join("regions.csv");
     let rec_path = Path::new(data_dir).join("records.csv");
 
-    let reg_data = read_file_or_mmap(&reg_path);
-    let rec_data = read_file_or_mmap(&rec_path);
+    let reg_data = read_file_bytes(&reg_path).expect("open regions.csv failed");
+    let rec_data = read_file_bytes(&rec_path).expect("open records.csv failed");
 
-    if reg_data.is_empty() || rec_data.is_empty() {
-        let _ = File::create(&out_path);
-        return;
-    }
-
-    let regions = RegionTable::parse(reg_data);
-    let num_countries = (regions.unmatched_idx + 1) as usize;
+    let lookup = RegionLookup::parse(reg_data);
 
     let mut start_pos = 0;
     if rec_data.starts_with(BOM) {
@@ -687,96 +743,153 @@ fn main() {
     }
 
     let payload = &rec_data[start_pos..];
-    let num_workers = 4;
-    let boundaries = find_chunk_boundaries(payload, num_workers);
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(12).clamp(1, 16);
+    let num_chunks = num_threads;
+    let boundaries = find_chunk_boundaries(payload, num_chunks);
 
-    let mut worker_states: Vec<WorkerState> = std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(num_workers);
-        for i in 0..num_workers {
-            let chunk_start = boundaries[i];
-            let chunk_end = boundaries[i + 1];
-            let r_ref = &regions;
-            handles.push(
-                s.spawn(move || parse_chunk(payload, chunk_start, chunk_end, num_countries, r_ref)),
-            );
+    let mut chunk_results: Vec<WorkerState> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_chunks);
+        for i in 0..num_chunks {
+            let start = boundaries[i];
+            let end = boundaries[i + 1];
+            let l_ref = &lookup;
+            handles.push(s.spawn(move || {
+                parse_records_chunk(payload, start, end, l_ref)
+            }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Destructive merge into worker 0
-    let mut base = worker_states.swap_remove(0);
-    let mut remap_buf = Vec::with_capacity(16384);
+    // Merge into worker 0 destructively
+    let mut base_state = chunk_results.swap_remove(0);
+    for agg in base_state.aggs.iter_mut() {
+        if agg.count > 0 && agg.seen_names.len() < 2048 {
+            agg.seen_names.resize(2048, 0);
+        }
+    }
+    let mut remap_buf = Vec::with_capacity(32 * 1024);
 
-    while !worker_states.is_empty() {
-        let mut other = worker_states.pop().unwrap();
+    while !chunk_results.is_empty() {
+        let mut other_worker = chunk_results.pop().unwrap();
         remap_buf.clear();
-        let other_count = other.pool.count;
+        let other_count = other_worker.pool.len();
         for i in 0..other_count {
-            let entry = other.pool.entries[i];
-            let bytes = other.pool.get_bytes(entry.offset, entry.len as usize);
-            let global_id = base.pool.intern_slice(bytes, entry.hash);
+            let (entry, name) = other_worker.pool.get_name_entry(i as u32);
+            let global_id = if (entry.offset & ARENA_FLAG) == 0 {
+                base_state.pool.intern_ref(entry.offset as usize, entry.len as usize, entry.hash)
+            } else {
+                base_state.pool.intern_slice(name, entry.hash)
+            };
             remap_buf.push(global_id);
         }
-        drop(other.pool);
+        drop(other_worker.pool);
 
-        for c in 0..num_countries {
-            let o_agg = &mut other.aggs[c];
-            if o_agg.count == 0 {
+        for c in 0..=UNMATCHED_COUNTRY_IDX {
+            let other_agg = &mut other_worker.aggs[c];
+            if other_agg.count == 0 {
                 continue;
             }
-            let b_agg = &mut base.aggs[c];
-            if b_agg.count == 0 {
-                b_agg.amount_min = o_agg.amount_min;
-                b_agg.amount_max = o_agg.amount_max;
+            let base_agg = &mut base_state.aggs[c];
+            if base_agg.count == 0 {
+                base_agg.amount_min = other_agg.amount_min;
+                base_agg.amount_max = other_agg.amount_max;
             } else {
-                b_agg.amount_min = b_agg.amount_min.min(o_agg.amount_min);
-                b_agg.amount_max = b_agg.amount_max.max(o_agg.amount_max);
+                if other_agg.amount_min < base_agg.amount_min {
+                    base_agg.amount_min = other_agg.amount_min;
+                }
+                if other_agg.amount_max > base_agg.amount_max {
+                    base_agg.amount_max = other_agg.amount_max;
+                }
             }
-            b_agg.count += o_agg.count;
-            b_agg.id_sum += o_agg.id_sum;
-            b_agg.amount_sum += o_agg.amount_sum;
-            b_agg.name_bytes += o_agg.name_bytes;
-            b_agg.note_bytes += o_agg.note_bytes;
+            base_agg.count += other_agg.count;
+            base_agg.id_sum += other_agg.id_sum;
+            base_agg.amount_sum += other_agg.amount_sum;
+            base_agg.name_bytes += other_agg.name_bytes;
+            base_agg.note_bytes += other_agg.note_bytes;
 
-            for (w_idx, &word) in o_agg.seen_names.iter().enumerate() {
+            for (w_idx, &word) in other_agg.seen_names.iter().enumerate() {
                 if word == 0 {
                     continue;
                 }
-                let mut temp = word;
-                let mut bit_idx = 0;
-                while temp > 0 {
-                    if (temp & 1) != 0 {
-                        let other_nid = (w_idx * 64 + bit_idx) as u32;
-                        let global_nid = remap_buf[other_nid as usize];
-                        b_agg.mark_name(global_nid);
-                    }
-                    temp >>= 1;
-                    bit_idx += 1;
+                let mut bits = word;
+                while bits != 0 {
+                    let bit_idx = bits.trailing_zeros() as usize;
+                    let other_nid = (w_idx * 64 + bit_idx) as u32;
+                    let global_nid = remap_buf[other_nid as usize];
+                    base_agg.mark_name_fast(global_nid);
+                    bits &= bits - 1;
                 }
             }
         }
     }
 
-    let mut active_indices = Vec::new();
-    for i in 0..regions.unmatched_idx as usize {
-        if base.aggs[i].count > 0 {
-            active_indices.push(i);
-        }
-    }
-    active_indices.sort_unstable_by_key(|&i| regions.countries[i]);
-
-    let mut out_file = File::create(&out_path).unwrap();
+    // Output formatting
     let mut out_buf = Vec::with_capacity(64 * 1024);
+    for (i, c_code) in lookup.countries.iter().enumerate() {
+        let agg = &base_state.aggs[i];
+        if agg.count == 0 {
+            continue;
+        }
+        out_buf.extend_from_slice(c_code);
+        out_buf.push(b' ');
+        write_u64(&mut out_buf, agg.count);
+        out_buf.push(b' ');
+        write_u64(&mut out_buf, agg.id_sum);
+        out_buf.push(b' ');
+        write_money(&mut out_buf, agg.amount_sum);
+        out_buf.push(b' ');
+        write_money(&mut out_buf, agg.amount_min);
+        out_buf.push(b' ');
+        write_money(&mut out_buf, agg.amount_max);
+        out_buf.push(b' ');
 
-    for idx in active_indices {
-        write_line(&mut out_buf, &regions.countries[idx], &base.aggs[idx]);
-    }
-    let u_idx = regions.unmatched_idx as usize;
-    if base.aggs[u_idx].count > 0 {
-        write_line(&mut out_buf, b"_UNMATCHED", &base.aggs[u_idx]);
+        let distinct_names: u64 = agg.seen_names.iter().map(|w| w.count_ones() as u64).sum();
+        write_u64(&mut out_buf, distinct_names);
+        out_buf.push(b' ');
+        write_u64(&mut out_buf, agg.name_bytes);
+        out_buf.push(b' ');
+        write_u64(&mut out_buf, agg.note_bytes);
+        out_buf.push(b'\n');
     }
 
-    if !out_buf.is_empty() {
-        out_file.write_all(&out_buf).unwrap();
+    // Unmatched country
+    let un_agg = &base_state.aggs[UNMATCHED_COUNTRY_IDX];
+    if un_agg.count > 0 {
+        out_buf.extend_from_slice(b"_UNMATCHED ");
+        write_u64(&mut out_buf, un_agg.count);
+        out_buf.push(b' ');
+        write_u64(&mut out_buf, un_agg.id_sum);
+        out_buf.push(b' ');
+        write_money(&mut out_buf, un_agg.amount_sum);
+        out_buf.push(b' ');
+        write_money(&mut out_buf, un_agg.amount_min);
+        out_buf.push(b' ');
+        write_money(&mut out_buf, un_agg.amount_max);
+        out_buf.push(b' ');
+
+        let distinct_names: u64 = un_agg.seen_names.iter().map(|w| w.count_ones() as u64).sum();
+        write_u64(&mut out_buf, distinct_names);
+        out_buf.push(b' ');
+        write_u64(&mut out_buf, un_agg.name_bytes);
+        out_buf.push(b' ');
+        write_u64(&mut out_buf, un_agg.note_bytes);
+        out_buf.push(b'\n');
+    }
+
+    fs::write(&out_file, out_buf).expect("write aggregates.txt failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_c() {
+        let reg = b"region_id,country_code\n1,USA\n2,CAN\n";
+        let rec = b"id,name,note,region_id,amount\n1,Alice,Note,1,10.50\n2,Bob,Note,2,20.00\n";
+        let l = RegionLookup::parse(reg);
+        let b = find_chunk_boundaries(rec, 1);
+        let s = parse_records_chunk(rec, b[0], b[1], &l);
+        assert_eq!(s.aggs[0].count, 1);
     }
 }
